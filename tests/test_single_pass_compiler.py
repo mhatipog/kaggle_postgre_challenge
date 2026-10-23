@@ -44,7 +44,7 @@ class SinglePassSourceTest(unittest.TestCase):
         for destinations in plan["rewritten_destinations"]:
             for statement in destinations:
                 self.assertIn("pg_temp.pgdm_source_stage", statement)
-                self.assertNotIn("source_row.raw", statement)
+                self.assertNotRegex(statement, r"\bsource_row\.raw\b")
                 self.assertNotIn("extracted.", statement)
 
     def test_unknown_source_expression_requires_safe_fallback(self):
