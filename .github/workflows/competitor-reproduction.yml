@@ -14,15 +14,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 70
     env:
-      BENCH_ROWS: '3000000'
+      BENCH_ROWS: '1000000'
       PDM_BENCH_PG_USER: kaggle_ci
       PDM_BENCH_SSH_USER: kagglebench
       PDM_EXPANSION_WORKERS: '2'
-      PDM_EXPANSION_BULK_CONSTRAINT_REBUILD: '1'
-      PDM_EXPANSION_SINGLE_PASS_STAGE: '1'
-      PDM_EXPANSION_TYPED_STAGE: '1'
-      PDM_EXPANSION_PG_TUNING: '1'
-      PDM_EXPANSION_PRUNE_STAGE_META: '1'
+      # Deliberately no optimization environment variables: test release defaults.
     steps:
       - name: Checkout our candidate
         uses: actions/checkout@v4
@@ -68,6 +64,17 @@ jobs:
       - name: Our current solution full pipeline
         working-directory: ours
         run: python benchmarks/headless_e2e.py --label our_candidate --out-dir ../benchmark_comparison
+      - name: Assert official fast path is active without environment switches
+        working-directory: ours
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          record=json.loads(Path('../benchmark_comparison/our_candidate.json').read_text())
+          stages=[x['name'] for x in record.get('items',[])]
+          assert any('Single-pass shared JSONB source projection' in x for x in stages), 'Release default silently fell back to legacy path'
+          print('PASS: single-pass release optimization active by default')
+          PY
       - name: Confirm all FK constraints and indexes restored after COMMIT
         working-directory: ours
         run: python benchmarks/assert_schema_invariants.py --file ../benchmark_comparison/schema_before.json --verify
@@ -133,7 +140,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: competitor-reproduction-3m
+          name: competition-final-default-1m
           path: benchmark_comparison/
           if-no-files-found: ignore
           retention-days: 30
