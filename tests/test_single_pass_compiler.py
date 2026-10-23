@@ -1,5 +1,6 @@
 """Regression gates for the opt-in single-pass JSONB staging compiler."""
 from pathlib import Path
+from unittest.mock import patch
 import unittest
 
 from services.postgres_service import PostgresAdminService
@@ -58,6 +59,16 @@ class SinglePassSourceTest(unittest.TestCase):
         self.assertNotIn("BTRIM(position_data.weight_text)", typed["rewritten_destinations"][5][0])
         self.assertNotIn("BTRIM(position_data.declared_number_text)", typed["rewritten_destinations"][5][0])
         self.assertIn("pg_temp.pgdm_source_stage", typed["rewritten_destinations"][5][0])
+
+    def test_typed_stage_prunes_unused_metadata_when_requested(self):
+        prepared = self.make_prepared()
+        stage = plan_single_pass_projection(prepared, self.source_columns())
+        with patch.dict("os.environ", {"PDM_EXPANSION_PRUNE_STAGE_META": "1"}):
+            typed = specialize_typed_fields(prepared, stage)
+        self.assertIn("s.raw_id,", typed["stage_sql"])
+        for unused in ("raw_hash", "raw_schema", "raw_ingested_at", "raw_tab"):
+            self.assertNotIn(f"    s.{unused},", typed["stage_sql"])
+        self.assertIn("WHERE s.raw_schema IN", typed["stage_sql"])
 
     def test_typed_optimization_falls_back_for_unexpected_expression(self):
         prepared = self.make_prepared()
