@@ -14022,6 +14022,14 @@ SELECT payload::text FROM pg_temp.pgdm_expansion_manifest_payload;
         )
         self._raise_if_cancelled(cancel_event)
 
+        # An experimental, conservative single-pass source compiler. It only
+        # activates for the exact validated PostgreSQL built-in text patterns;
+        # unfamiliar SQL is executed by the unchanged original safe path.
+        projection_plan = None
+        if os.getenv("PDM_EXPANSION_SINGLE_PASS_STAGE", "0") == "1":
+            from services.expansion_stage import plan_single_pass_projection
+            projection_plan = plan_single_pass_projection(prepared, source_columns)
+
         # This job id ties destination commit, outbox, and control-db receipt.
         expansion_job_id = uuid.uuid4().hex
         expansion_request = {
@@ -14045,14 +14053,19 @@ SELECT payload::text FROM pg_temp.pgdm_expansion_manifest_payload;
         ):
             execution_statements = []
             timing_sequence = 10
-            for destination in prepared["destinations"]:
+            for destination_index, destination in enumerate(prepared["destinations"]):
                 for statement_index, statement in enumerate(
                     destination["statements"],
                     start=1,
                 ):
+                    compiled_statement = statement
+                    if projection_plan is not None:
+                        compiled_statement = projection_plan["rewritten_destinations"][
+                            destination_index
+                        ][statement_index - 1]
                     execution_statements.append(
                         self._build_managed_dml_sql(
-                            statement,
+                            compiled_statement,
                             destination["schema_name"],
                             destination["pure_table_name"],
                             "add",
@@ -14200,6 +14213,16 @@ BEGIN
 END
 $pgdm_bulk$;
 """
+            projection_sql = ""
+            if projection_plan is not None:
+                projection_sql = (
+                    "INSERT INTO pg_temp.pgdm_expansion_timings VALUES "
+                    "(4, 'execute', 'Single-pass shared JSONB source projection', "
+                    "clock_timestamp(), NULL, NULL, NULL, NULL);\n"
+                    + projection_plan["stage_sql"]
+                    + "\nUPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
+                    "clock_timestamp() WHERE sequence_number = 4;\n"
+                )
             wrapped_sql = (
                 journal_table_sql
                 + "\n"
@@ -14223,6 +14246,7 @@ $pgdm_bulk$;
                 + manifest_sql
                 + "\nUPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
                 + "clock_timestamp() WHERE sequence_number = 3;\n\n"
+                + "\n\n" + projection_sql
                 + "\n\n" + bulk_fk_prepare_sql
                 + "\n\n".join(execution_statements)
                 + "\n\n" + bulk_fk_restore_sql
