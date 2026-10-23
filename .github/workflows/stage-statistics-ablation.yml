@@ -79,8 +79,6 @@ jobs:
         env:
           PDM_EXPANSION_STAGE_STATS: join-only
         run: python benchmarks/headless_e2e.py --label our_candidate --out-dir ../benchmark_comparison
-        working-directory: ours
-        run: python benchmarks/headless_e2e.py --label our_candidate --out-dir ../benchmark_comparison
       - name: Assert official fast path is active without environment switches
         working-directory: ours
         run: |
