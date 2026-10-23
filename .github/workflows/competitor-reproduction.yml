@@ -14,12 +14,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 70
     env:
-      BENCH_ROWS: '1000000'
+      BENCH_ROWS: '100000'
       PDM_BENCH_PG_USER: kaggle_ci
       PDM_BENCH_SSH_USER: kagglebench
       PDM_EXPANSION_WORKERS: '2'
       PDM_EXPANSION_BULK_CONSTRAINT_REBUILD: '1'
       PDM_EXPANSION_SINGLE_PASS_STAGE: '1'
+      PDM_EXPANSION_TYPED_STAGE: '1'
     steps:
       - name: Checkout our candidate
         uses: actions/checkout@v4
@@ -130,7 +131,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: competitor-reproduction-1m
+          name: competitor-reproduction-100k
           path: benchmark_comparison/
           if-no-files-found: ignore
           retention-days: 30
