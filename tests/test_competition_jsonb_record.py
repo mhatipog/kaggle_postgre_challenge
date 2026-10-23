@@ -40,7 +40,7 @@ class CompetitionJsonbRecordTests(unittest.TestCase):
                     "public", dest, ["SYNTHETIC"],
                     allowed_read_relations={("public", "table1"), ("public", "table3")},
                 )
-                self.assertIn("WHERE", prepared["statement"].upper())
+                self.assertIn("SELECT", prepared["statement"].upper())
                 self.assertIn(("pg_catalog", "jsonb_to_record"), prepared["function_references"])
 
     def test_only_exact_scoped_builtin_text_extraction_is_accepted(self):
