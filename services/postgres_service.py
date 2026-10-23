@@ -14029,6 +14029,9 @@ SELECT payload::text FROM pg_temp.pgdm_expansion_manifest_payload;
         if os.getenv("PDM_EXPANSION_SINGLE_PASS_STAGE", "0") == "1":
             from services.expansion_stage import plan_single_pass_projection
             projection_plan = plan_single_pass_projection(prepared, source_columns)
+            if projection_plan is not None and os.getenv("PDM_EXPANSION_TYPED_STAGE", "0") == "1":
+                from services.expansion_stage_typed import specialize_typed_fields
+                projection_plan = specialize_typed_fields(prepared, projection_plan)
 
         # This job id ties destination commit, outbox, and control-db receipt.
         expansion_job_id = uuid.uuid4().hex
