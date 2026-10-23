@@ -1,0 +1,48 @@
+name: Official-data PostgreSQL SQL benchmark
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'benchmarks/**'
+      - 'SQL files/**'
+      - 'services/**'
+      - 'tests/**'
+  workflow_dispatch:
+
+jobs:
+  postgres-ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies and start PostgreSQL
+        run: |
+          python -m pip install -r requirements.txt
+          sudo systemctl start postgresql
+          psql --version
+      - name: Create isolated local benchmark role
+        shell: bash
+        run: |
+          password="$(openssl rand -hex 24)"
+          echo "::add-mask::$password"
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE kaggle_ci WITH LOGIN CREATEDB PASSWORD '$password';"
+          echo "PGPASSWORD=$password" >> "$GITHUB_ENV"
+          echo "PG_KAGGLE_CHALLENGE_PASS=$password" >> "$GITHUB_ENV"
+      - name: Generate official 10,000-row challenge database (unchanged generator)
+        run: |
+          python generate_database.py --rows 10000 --host 127.0.0.1 --postgres_port 5432 --user kaggle_ci --admin_database postgres
+      - name: Benchmark baseline and candidate on identical official data
+        run: |
+          python benchmarks/compare_sql.py --host 127.0.0.1 --user kaggle_ci --out benchmark_results.json
+      - name: Upload metrics for inspection
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sql-benchmark-results
+          path: benchmark_results.json
+          if-no-files-found: ignore
