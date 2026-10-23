@@ -1,0 +1,185 @@
+name: Manifest-from-stage same-run correctness and speed
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/manifest-from-stage.yml'
+      - 'services/postgres_service.py'
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    env:
+      BENCH_ROWS: '1000000'
+      PDM_BENCH_PG_USER: kaggle_ci
+      PDM_BENCH_SSH_USER: kagglebench
+      PDM_EXPANSION_WORKERS: '2'
+      PDM_EXPANSION_MANIFEST_FROM_STAGE: '1'
+      # Deliberately no optimization environment variables: test release defaults.
+    steps:
+      - name: Checkout our candidate
+        uses: actions/checkout@v4
+        with:
+          path: ours
+          persist-credentials: false
+      - name: Checkout pinned competitor
+        uses: actions/checkout@v4
+        with:
+          repository: bcap52/kaggle_postgre_challenge
+          ref: 7b81ca2797f06304d81477afcb0cfb3dad75ff43
+          path: competitor
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install dependencies PostgreSQL and localhost SSH daemon
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -r ours/requirements.txt
+          sudo systemctl start postgresql
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server
+          sudo mkdir -p /run/sshd
+          password="$(openssl rand -hex 24)"
+          echo "::add-mask::$password"
+          sudo useradd -m -s /bin/bash kagglebench
+          printf '%s:%s\n' kagglebench "$password" | sudo chpasswd
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE kaggle_ci WITH LOGIN CREATEDB PASSWORD '$password';"
+          sudo /usr/sbin/sshd -p 2222 -o PasswordAuthentication=yes -o UsePAM=no
+          echo "PDM_BENCH_PASSWORD=$password" >> "$GITHUB_ENV"
+          echo "PGPASSWORD=$password" >> "$GITHUB_ENV"
+          echo "PG_KAGGLE_CHALLENGE_PASS=$password" >> "$GITHUB_ENV"
+          pg_isready -h localhost -p 5432
+      - name: Generate official unchanged data
+        working-directory: ours
+        run: |
+          python generate_database.py --rows "$BENCH_ROWS" --host 127.0.0.1 --postgres_port 5432 --user kaggle_ci --admin_database postgres
+      - name: Snapshot original FK, unique and index definitions
+        working-directory: ours
+        run: python benchmarks/assert_schema_invariants.py --file ../benchmark_comparison/schema_before.json
+      - name: Our current solution full pipeline
+        working-directory: ours
+        run: python benchmarks/headless_e2e.py --label our_candidate --out-dir ../benchmark_comparison
+      - name: Assert official fast path is active without environment switches
+        working-directory: ours
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          record=json.loads(Path('../benchmark_comparison/our_candidate.json').read_text())
+          stages=[x['name'] for x in record.get('items',[])]
+          assert any('Single-pass shared JSONB source projection' in x for x in stages), 'Release default silently fell back to legacy path'
+          print('PASS: single-pass release optimization active by default')
+          PY
+      - name: Confirm all FK constraints and indexes restored after COMMIT
+        working-directory: ours
+        run: python benchmarks/assert_schema_invariants.py --file ../benchmark_comparison/schema_before.json --verify
+      - name: Verify dependency manifest matches unmodified raw source
+        working-directory: ours
+        run: |
+          python - <<'PY'
+          import os,subprocess
+          sql = """
+          WITH original AS (
+            SELECT raw_schema::text AS raw_schema, raw_hash::text AS raw_hash,
+                   count(*)::bigint AS row_count
+            FROM public.raw_data WHERE raw_schema IN ('group001')
+            GROUP BY raw_schema, raw_hash
+          ), expected AS (
+            SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                   'raw_schema',raw_schema,'raw_hash',raw_hash,
+                   'row_count',row_count) ORDER BY raw_schema,raw_hash NULLS FIRST),
+                   '[]'::jsonb) AS hashes,
+                   sum(row_count) AS num,
+                   count(DISTINCT raw_hash) AS hashes_count
+            FROM original
+          ), actual AS (
+            SELECT source_manifest AS payload
+            FROM pgdm_runtime.expansion_commits
+            ORDER BY committed_at DESC LIMIT 1
+          )
+          SELECT CASE WHEN
+            actual.payload -> 'raw_hash_manifest' = expected.hashes
+            AND (actual.payload ->> 'expected_row_count')::bigint = expected.num
+            AND (actual.payload ->> 'expected_distinct_raw_hash_count')::bigint = expected.hashes_count
+            THEN 'PASS' ELSE 'FAIL' END
+          FROM expected CROSS JOIN actual;
+          """
+          r=subprocess.run(['psql','-h','127.0.0.1','-U',
+                            os.environ['PDM_BENCH_PG_USER'],'-d',
+                            'kaggle_challenge','-X','-qAt','-v','ON_ERROR_STOP=1'],
+                            input=sql,text=True,capture_output=True,check=True)
+          assert r.stdout.strip()=='PASS', 'Dependency manifest mismatch: '+r.stdout+r.stderr
+          print('PASS: source dependency manifest unchanged')
+          PY
+      - name: Reset destinations and versions without changing raw data
+        working-directory: competitor
+        run: python benchmarks/reset_challenge.py
+      - name: Competitor classic baseline
+        working-directory: competitor
+        env:
+          PDM_EXPANSION_FASTPATH: '0'
+        run: |
+          python benchmarks/expansion_driver.py --out-dir ../benchmark_comparison --label competitor_baseline
+          python ../ours/benchmarks/headless_e2e.py --inspect-only --label competitor_baseline --out-dir ../benchmark_comparison
+      - name: Reset destinations and versions without changing raw data
+        working-directory: competitor
+        run: python benchmarks/reset_challenge.py
+      - name: Competitor optimized fast path
+        working-directory: competitor
+        env:
+          PDM_EXPANSION_FASTPATH: '1'
+        run: |
+          python benchmarks/expansion_driver.py --out-dir ../benchmark_comparison --label competitor_fastpath
+          python ../ours/benchmarks/headless_e2e.py --inspect-only --label competitor_fastpath --out-dir ../benchmark_comparison
+      - name: Verify six destination contents and compare full timing
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path("benchmark_comparison")
+          own=json.loads((p/"our_candidate.json").read_text())
+          original=json.loads((p/"competitor_baseline.json").read_text())
+          competitor=json.loads((p/"competitor_fastpath.json").read_text())
+          assert own["signatures"]==original["signatures"], "Our outputs differ from classic"
+          assert competitor["signatures"]==original["signatures"], "Competitor outputs differ from classic"
+          def seconds(mode):
+              if mode=="our_candidate":
+                  return own["measured_processing_total"]
+              files=sorted(p.glob("*_"+mode+".json"))
+              assert files, "Missing report: "+mode
+              return json.loads(files[-1].read_text())["measured_processing_total"]
+          base=seconds("competitor_baseline")
+          fast=seconds("competitor_fastpath")
+          ours=seconds("our_candidate")
+          summary={"rows":int(__import__("os").environ["BENCH_ROWS"]),"baseline_s":base,"competitor_s":fast,"ours_s":ours,
+                   "competitor_speedup_x":round(base/fast,3),
+                   "our_speedup_x":round(base/ours,3),
+                   "fingerprints":"identical for all six normalized tables",
+                   "environment":"Linux local SSH + PostgreSQL on identical runner"}
+          (p/"summary.json").write_text(json.dumps(summary,indent=2)+"\n")
+          print(json.dumps(summary,indent=2))
+          with open(__import__("os").environ["GITHUB_STEP_SUMMARY"],"a") as f:
+              f.write("## Independent SSH + PostgreSQL benchmark\n\n")
+              f.write("| Case | MEASURED PROCESSING TOTAL (s) |\n|---|---:|\n")
+              for mode,value in [("Baseline",base),("Competitor",fast),("Our submission",ours)]:
+                  f.write(f"| {mode} | {value:.3f} |\n")
+              f.write("\nOutput parity: **PASS** (six destinations)\n")
+          PY
+      - name: Failure injection and durable post-commit recovery with optimization enabled
+        working-directory: ours
+        run: python benchmarks/test_recovery_integration.py --user kaggle_ci
+      - name: Upload all benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-from-stage-1m
+          path: benchmark_comparison/
+          if-no-files-found: ignore
+          retention-days: 30
