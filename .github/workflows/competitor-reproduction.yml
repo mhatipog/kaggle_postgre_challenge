@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 70
     env:
-      BENCH_ROWS: '100000'
+      BENCH_ROWS: '1000000'
       PDM_BENCH_PG_USER: kaggle_ci
       PDM_BENCH_SSH_USER: kagglebench
       PDM_EXPANSION_WORKERS: '2'
@@ -101,7 +101,7 @@ jobs:
           base=seconds("competitor_baseline")
           fast=seconds("competitor_fastpath")
           ours=seconds("our_candidate")
-          summary={"rows":100000,"baseline_s":base,"competitor_s":fast,"ours_s":ours,
+          summary={"rows":int(__import__("os").environ["BENCH_ROWS"]),"baseline_s":base,"competitor_s":fast,"ours_s":ours,
                    "competitor_speedup_x":round(base/fast,3),
                    "our_speedup_x":round(base/ours,3),
                    "fingerprints":"identical for all six normalized tables",
@@ -119,7 +119,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: competitor-reproduction-100k
+          name: competitor-reproduction-1m
           path: benchmark_comparison/
           if-no-files-found: ignore
           retention-days: 30
