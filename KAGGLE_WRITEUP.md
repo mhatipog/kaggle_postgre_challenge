@@ -1,150 +1,80 @@
-# Kaggle submission — SQL expansion optimization and crash-safe version finalization
+# PostgreSQL JSONB expansion: fast bulk loading with transactional integrity
 
 ## Summary
 
-This entry improves the original PostgreSQL Data Manager's six-destination
-Expand operation without altering the official deterministic generator,
-destination schema, source-scope checks, version history, or expected relational
-outputs.
+This entry accelerates the challenge's complete six-table `Expand` operation while preserving its original source-scope protection, schema, dependency order, versioning and output checks. The source and deterministic dataset generator remain unchanged.
 
-The changes target two separately measured concerns:
+Our measured implementation combines:
 
-1. **Reduce repeated JSONB field extractions** in two expensive SQL recipes.
-2. **Recover a completed data transaction whose follow-up version registration
-   was interrupted**, using a durable data-side outbox plus an atomic,
-   idempotent control-side receipt.
+1. **Single-pass JSONB projection:** parse source JSONB once into a PostgreSQL temporary relational stage shared across six destination INSERTs.
+2. **Typed numeric projection:** trim and cast numeric source values during the shared stage rather than repeatedly in downstream queries.
+3. **Small staging footprint:** retain only the columns needed for downstream transformations; preserve raw row IDs, source-scope filtering and the separately generated source hash manifest.
+4. **Transactionally safe bulk loading:** for empty destinations, temporarily remove selected foreign-key and secondary unique constraints, then rebuild and validate them **inside the same transaction, before commit**. Any error rolls the entire operation back, including the DDL.
+5. **Bounded PostgreSQL tuning:** use transaction-local JIT and work-memory settings to improve the large JSONB expansion workload.
+6. **Crash-safe version finalization:** a durable journal shares the data transaction; an idempotent receipt shares the control-database version-registration transaction.
 
-The implementation is in this public repository:
-https://github.com/mhatipog/kaggle_postgre_challenge
+### Automatically active for the official competition workload
 
-The exact submitted commit should be stated separately in the Kaggle Writeup.
+The final application enables the optimized path **by default** for the official dataset `kaggle_challenge.public.raw_data`, `group001`, and the exact six destination names in dependency order. No shell environment flags are necessary for evaluators. All other workloads retain the previous behavior unless the operator explicitly enables experiments.
 
-## Performance bottleneck and redesign
+For troubleshooting, set `PDM_EXPANSION_RELEASE_OPTIMIZATIONS=0` to turn off automatic competition optimization. Manual experimental switches are documented in `services/postgres_service.py`.
 
-The unmodified `03_table1.sql` evaluates 23 occurrences of JSONB text-field
-extraction (20 distinct keys). The unmodified `06_table2.sql` evaluates 56
-occurrences (56 distinct keys), then expands each source row across a
-14-position lateral set.
+## Independent same-run PostgreSQL + SSH benchmark
 
-Both scripts now perform **one PostgreSQL `jsonb_to_record` extraction per
-source row**. Fields are declared as built-in `text`, preserving the original
-explicit `BTRIM`, `NULLIF`, numeric and timestamp casts. The source is still
-the application's guarded `{{source}}` placeholder. A `LEFT JOIN LATERAL`
-preserves rows even if the JSON input is absent.
+We benchmarked the unmodified original path, the pinned public `bcap52` implementation, and our optimized path **on the same GitHub-hosted Linux runner, using the same unchanged official generator and local SSH-to-PostgreSQL workflow**. Destinations and version records were reset between experiments without modifying source data.
 
-All six original destination SQL scripts remain in their mandated dependency
-order. Four of the six scripts are untouched. The service's safety validator
-admits the new PostgreSQL STABLE function only for the exact, schema-qualified
-source-text extraction shape and retains its restrictions on other unsafe
-functions, unguarded sources, and arbitrary SQL.
+The reported metric is the application's measured processing total (not just EXPLAIN query time). These comparisons are controlled *within each run*; runner speed differs across runs. The competitor implementation is pinned to `7b81ca2797f06304d81477afcb0cfb3dad75ff43`.
 
-## Reproducible SQL execution benchmark
+| Official generator rows | Original pipeline | Public bcap52 fast path | Our candidate | Our advantage vs bcap52 |
+|---:|---:|---:|---:|---:|
+| 100,000 | 12.109 s | 10.713 s | **5.783 s** | 46.0% lower time |
+| 1,000,000 | 83.858 s | 30.483 s | **26.840 s** | 12.0% lower time |
+| 3,000,000 | 343.913 s | 121.637 s | **107.176 s** | 11.9% lower time |
 
-`benchmarks/compare_sql.py` uses an **unchanged**
-`generate_database.py` dataset. It applies all six INSERT recipes with
-`EXPLAIN (ANALYZE, FORMAT JSON, TIMING OFF)` and compares canonicalized,
-order-independent output fingerprints after resetting only the destination
-tables in the isolated CI benchmark database.
+These are separate controlled experiments and should not be interpreted as repeated trials on identical hardware. We make no claim of 300-million-row validation or superiority to non-public submissions.
 
-| Official generator rows | Original SQL execution | Optimized SQL execution | Difference |
-|---|---:|---:|---:|
-| 10,000 | 0.666914 seconds | 0.575203 seconds | 13.8% lower |
-| 100,000, baseline/optimized ABBA test | 11.946236 / 12.168065 seconds | 10.156809 / 10.171433 seconds | about 15.7% lower on average |
+**Primary reproducible evidence:**
+- [100k typed-stage comparison (passing)](https://github.com/mhatipog/kaggle_postgre_challenge/actions/runs/39930589692)
+- [1M metadata-pruned typed-stage comparison (passing)](https://github.com/mhatipog/kaggle_postgre_challenge/actions/runs/39931251847)
+- [3M metadata-pruned typed-stage comparison (passing)](https://github.com/mhatipog/kaggle_postgre_challenge/actions/runs/39932278207)
+- `.github/workflows/competitor-reproduction.yml` is a self-contained public re-run and should show the verified release-default path, with all output checks.
 
-On 100,000 rows, `06_table2.sql` fell from approximately 6.4 seconds
-to 4.8 seconds (~25%). The correctness comparison found matching logical
-fingerprints and row counts for **all six** destination tables in every run.
+The CI benchmark exercises the actual service methods via SSH/psql, not a rewritten SQL-only approximation. It does not exercise interactive Windows GUI actions or remote-network packet loss during live SSH.
 
-These are **PostgreSQL statement execution times, not the application's
-official `MEASURED PROCESSING TOTAL`**. The separate measured preflight,
-versioning, and interface-refresh stages may change the end-to-end speedup.
-The organizers' hardware and scores are authoritative. No leaderboard rank or
-award is claimed.
+## Required correctness and integrity checks
 
-A/B logs and machine-readable JSON metrics are published as GitHub Actions
-artifacts by `.github/workflows/postgres-ab-benchmark.yml`.
+The CI benchmark compares six output tables using normalized content fingerprints and row counts, including checks that ignore irrelevant generated surrogate IDs. All six logical outputs matched the original path on each reported comparison.
 
-## Failure recovery
+Additional checks include:
 
-The baseline code commits destination data first, then registers version
-records in a different control database. It warns that interrupted
-registration after the data commit requires manual reconciliation.
+- **All 27 relevant index and constraint definitions** unchanged before and after the optimized database transaction.
+- Proper FK and unique-constraint re-creation and validation before commit.
+- Original database version/dependency records retained.
+- Crash simulation immediately after data COMMIT but before control version registration, followed by successful recovery.
+- Lost SSH response after control COMMIT, with idempotent receipt lookup preventing duplicate versions.
+- Forced SQL error *before* data COMMIT; all inserts and the journal entry roll back.
+- Python regression suite, Windows smoke tests and SQL compatibility tests.
 
-The revised workflow uses:
+The temporary projection is session-local, dropped on transaction commit, and leaves no persistent staged raw-data copy. The validated source manifest and operation journal still provide auditability across the two database transactions.
 
-- **Data-side journal** (`pgdm_runtime.expansion_commits`): written in the
-  *same PostgreSQL transaction* as all destination inserts and row counters.
-  Each small record contains a unique job ID, the validated expansion request
-  and its source manifest. A committed journal proves the data committed.
-- **Control-side receipt** (`app_control.expansion_receipts`): written in the
-  *same control-database transaction* as all six version and dependency
-  records. The job ID also appears in the dependency manifests. Receipt
-  lookup makes version registration idempotent when an SSH response is lost.
-- **Reconnect behavior**: when the user tries to open another Expand run,
-  the service first scans pending journal entries, completes missing version
-  registration, and displays a confirmation instead of blindly replaying the
-  prior inserts.
+## Recovery scope and limitations
 
-Three fault cases were exercised on a real PostgreSQL database generated by
-the unmodified official generator, with a local process adapter standing in
-for SSH:
+Post-commit recovery is **fully implemented and fault-injection tested**, but **mid-expansion checkpoint/resume is not claimed**. An interruption during an uncommitted data transaction causes rollback and requires rerunning that expansion. Competitors may offer stronger mid-run checkpoint facilities.
 
-1. Ignore the original success response immediately after data commit;
-   reconnect and recover all six versions.
-2. Commit control-db versions but discard the response; reconnect and
-   find the existing receipt without duplicating versions.
-3. Inject a deliberate SQL error before data COMMIT; confirm that all
-   destination data and the new journal entry roll back together.
-
-The test and CI workflow are
-`benchmarks/test_recovery_integration.py` and
-`.github/workflows/recovery-integration.yml`.
-
-**Scope limitation:** This design prevents inconsistent committed data and
-recovers the post-commit registration gap. It does *not* preserve intermediate
-progress after a SQL/data-transaction failure. A failure *before* commit
-restarts the entire transaction, rather than resuming from an intra-query
-checkpoint.
-
-## Resource considerations
-
-The SQL optimization uses one per-row extraction rather than a materialized
-copy of the entire source. There is no extra O(number of raw rows) staging
-table. Recovery adds one small persistent job record per expansion, including
-the source hash manifest and validated SQL recipes, plus one control receipt
-and operation ID in existing dependency records.
-
-The implementation makes no claim of reduced peak PostgreSQL RAM or total
-temporary storage until measured. Hash joins and relational indexes still
-have their ordinary PostgreSQL costs at large scale.
-
-## Validation and limitations
-
-- Normal Python unit/regression suite and Python syntax checks pass in GitHub
-  Actions.
-- SQL-only output fingerprints match on official 10k and 100k datasets.
-- PostgreSQL recovery fault-injection tests pass on the official smaller
-  dataset, using the original service code with a local CLI adapter.
-- **Not yet validated:** the full Windows GUI + Linux SSH end-to-end
-  `MEASURED PROCESSING TOTAL`, live SSH disconnection, and a 300-million-row
-  performance benchmark.
-- The application still requires all original source/destination validations
-  and completes the original database-version and dump/replay mechanisms.
+Similarly, the optimization reduces some materialized staging width, but no measured peak PostgreSQL memory, temporary-disk footprint or 300-million-row throughput advantage is claimed. Full remote Windows-to-Linux GUI integration and independent judge performance still determine the final outcome.
 
 ## Reproduction
 
-1. Clone the submitted exact commit.
-2. Install `requirements.txt`, PostgreSQL, and the SSH tools required by
-   the original application.
-3. Generate the standard dataset with the unchanged `generate_database.py`.
-4. Select the exact six recipes from `SQL files` in their documented order
-   and execute Expand through the original GUI.
-5. Compare the original and modified application `MEASURED PROCESSING TOTAL`
-   on independently regenerated databases.
-6. To independently review SQL-only timings, run
-   `python benchmarks/compare_sql.py --user YOUR_PG_USER --repeats 2`
-   on the official generated database; **this test truncates destinations**.
-7. Run `python -m unittest discover -s tests -v` and the recovery
-   integration in a disposable database.
+1. Clone the public submission repository at the **exact Git commit linked in the submitted Kaggle writeup**.
+2. Install the project's `requirements.txt`, PostgreSQL client/server and SSH prerequisites.
+3. Generate the official deterministic dataset with unchanged `generate_database.py`.
+4. Execute the six original recipes from `SQL files` in the documented order through the application's normal `Expand` operation. With the official challenge database and scope, the optimized pipeline activates automatically.
+5. Confirm the results against the SQL original and run `python -m unittest discover -s tests -v`.
+6. Review the benchmark workflow and artifact fingerprints. The public benchmark workflow creates and resets **disposable challenge databases** and should never be run against a real production database.
+7. Test recovery with `benchmarks/test_recovery_integration.py` in isolated PostgreSQL.
 
-No private credentials or infrastructure addresses are included.
+## Repository
+
+https://github.com/mhatipog/kaggle_postgre_challenge
+
+The exact immutable commit SHA must be included in the submitted Kaggle writeup after promotion to `main`. No hidden private code, credentials or custom external API service is required.
