@@ -15053,6 +15053,123 @@ COMMIT;
             ]
         )
 
+    def _get_committed_expansion_receipt(
+        self, database_name: str, expansion_job_id: str,
+    ) -> list[dict] | None:
+        """Return an existing atomic control-db receipt; None means unregistered.
+
+        Store the receipt and destination version/dependency rows in the same
+        control-database transaction so a lost SSH response is retry-safe.
+        """
+        sql = f"""
+CREATE TABLE IF NOT EXISTS {EXPANSION_RECEIPT_TABLE} (
+    job_id text PRIMARY KEY,
+    registered_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+SELECT json_build_object(
+    'exists', EXISTS (
+        SELECT 1 FROM {EXPANSION_RECEIPT_TABLE}
+        WHERE job_id = {sql_literal(expansion_job_id)}
+    ),
+    'versions', COALESCE((
+        SELECT json_agg(
+            json_build_object(
+                'table_name', versions.schema_name || '.' || versions.table_name,
+                'version_code', versions.version_code,
+                'dependency_count', 1
+            )
+            ORDER BY versions.schema_name, versions.table_name
+        )
+        FROM {CONTROL_TABLE_VERSIONS} AS versions
+        JOIN {CONTROL_TABLE_VERSION_DEPENDENCIES} AS deps
+          ON deps.table_version_id = versions.id
+        WHERE deps.dependency_payload ->> 'expansion_job_id'
+              = {sql_literal(expansion_job_id)}
+          AND versions.database_name = {sql_literal(database_name)}
+    ), '[]'::json)
+)::text;
+""".strip()
+        command = (
+            f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+            f"-d {shlex.quote(CONTROL_DB)} -X -qAt -v ON_ERROR_STOP=1 "
+            f"-c {shlex.quote(sql)}"
+        )
+        output = self.run_remote_command(command).strip()
+        record = json.loads(output.splitlines()[-1])
+        if not record.get("exists"):
+            return None
+        versions = list(record.get("versions") or [])
+        if not versions:
+            raise RuntimeError(
+                "Expansion receipt exists but its registered versions are missing."
+            )
+        return versions
+
+    def _finalize_expansion_journal(
+        self, database_name: str, expansion_job_id: str,
+    ) -> None:
+        sql = (
+            f"UPDATE {EXPANSION_JOURNAL_TABLE} SET "
+            "finalized_at = COALESCE(finalized_at, clock_timestamp()) "
+            f"WHERE job_id = {sql_literal(expansion_job_id)};"
+        )
+        command = (
+            f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+            f"-d {shlex.quote(database_name)} -X -qAt -v ON_ERROR_STOP=1 "
+            f"-c {shlex.quote(sql)}"
+        )
+        self.run_remote_command(command)
+
+    def recover_pending_cross_table_expansions(
+        self, database_name: str, limit: int = 25,
+    ) -> list[dict]:
+        """Repair committed inserts whose control-db registration was interrupted.
+
+        The outbox marker is committed atomically with data. No marker means
+        the prior data transaction did not commit. This intentionally does NOT
+        checkpoint partially executed SQL statements.
+        """
+        if not 1 <= limit <= 100:
+            raise ValueError("Recovery limit must be between 1 and 100.")
+        command_base = (
+            f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+            f"-d {shlex.quote(database_name)} -X -qAt -v ON_ERROR_STOP=1 "
+        )
+        existence = self.run_remote_command(
+            command_base + "-c "
+            + shlex.quote("SELECT to_regclass('pgdm_runtime.expansion_commits');")
+        ).strip()
+        if not existence:
+            return []
+        sql = f"""
+SELECT json_build_object(
+    'request', request_payload,
+    'manifest', source_manifest
+)::text
+FROM {EXPANSION_JOURNAL_TABLE}
+WHERE finalized_at IS NULL
+ORDER BY committed_at, job_id
+LIMIT {int(limit)};
+""".strip()
+        output = self.run_remote_command(command_base + "-c " + shlex.quote(sql))
+        completed = []
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            result = dict(item["request"])
+            result["dependency_manifest"] = dict(item["manifest"])
+            registered = self.register_cross_table_expansion_versions(
+                expansion_result=result,
+                requested_by=result.get("requested_by") or "recovery",
+                workstation_name=result.get("workstation_name") or "recovery",
+                cancel_event=None,
+            )
+            completed.append(
+                {"expansion_job_id": result["expansion_job_id"], "versions": registered}
+            )
+        return completed
+
     def register_cross_table_expansion_versions(
         self,
         expansion_result: dict,
