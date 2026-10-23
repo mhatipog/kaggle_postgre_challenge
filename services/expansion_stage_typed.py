@@ -12,7 +12,7 @@ import re
 from utils import sql_ident
 
 
-def specialize_typed_fields(prepared: dict, plan: dict) -> dict:
+def specialize_typed_fields(prepared: dict, plan: dict, *, prune_unused_meta: bool = False) -> dict:
     expected = (
         "public.table3", "public.table4", "public.table1",
         "public.table5", "public.table6", "public.table2",
@@ -104,7 +104,7 @@ def specialize_typed_fields(prepared: dict, plan: dict) -> dict:
     # Keep unused metadata out of the 64-field projection. This is an
     # opt-in physical-layout optimization only: the protected source scope
     # and the independently generated version manifest are unchanged.
-    if os.getenv("PDM_EXPANSION_PRUNE_STAGE_META", "0") == "1":
+    if prune_unused_meta or os.getenv("PDM_EXPANSION_PRUNE_STAGE_META", "0") == "1":
         compiled_text = "\n".join(x for group in compiled for x in group)
         for metadata_column in (
             "raw_hash", "raw_schema", "raw_ingested_at", "raw_tab"
