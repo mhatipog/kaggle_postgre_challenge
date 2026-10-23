@@ -64,7 +64,7 @@ class ChallengeExpansionRecipeTests(unittest.TestCase):
                 for item in prepared["destinations"]
                 for _schema_name, function_name in item["function_references"]
             },
-            {"ascii", "btrim", "left", "right", "round", "upper"},
+            {"ascii", "btrim", "left", "right", "round", "upper", "jsonb_to_record"},
         )
 
 

@@ -13573,6 +13573,40 @@ WHERE database_name = {sql_literal(database_name)}
             "IN SHARE ROW EXCLUSIVE MODE;"
         )
 
+    @staticmethod
+    def _is_safe_text_jsonb_record_recipe(statement: str) -> bool:
+        """Recognize only built-in JSONB-to-text extraction from the guarded source.
+
+        PostgreSQL marks jsonb_to_record STABLE because arbitrary record
+        output types can invoke casts. Restrict it here to plain built-in
+        text columns and the already-scoped source_row.raw object.
+        """
+        occurrences = re.findall(
+            r"\b(?:pg_catalog\.)?jsonb_to_record\s*\(",
+            statement, flags=re.IGNORECASE,
+        )
+        if not occurrences:
+            return False
+        pattern = re.compile(
+            r"\bpg_catalog\.jsonb_to_record\s*\(\s*"
+            r"source_row\.raw\s*->\s*'values'\s*\)\s*"
+            r"AS\s+extracted\s*\(([^()]*)\)",
+            flags=re.IGNORECASE,
+        )
+        matches = list(pattern.finditer(statement))
+        if len(matches) != len(occurrences):
+            return False
+        for match in matches:
+            columns = [part.strip() for part in match.group(1).split(',')]
+            if not columns or len(columns) != len(set(columns)):
+                return False
+            if any(
+                not re.fullmatch(r"[a-z][a-z0-9_]*\s+text", column, re.I)
+                for column in columns
+            ):
+                return False
+        return True
+
     def _validate_cross_table_expansion_functions(
         self,
         database_name: str,
@@ -13674,12 +13708,33 @@ FROM requested;
             if not candidates:
                 problems.append(f"{function_label}: function not found")
                 continue
+            safe_text_jsonb_record = (
+                requested_schema == "pg_catalog"
+                and function_name == "jsonb_to_record"
+                and any(
+                    "jsonb_to_record" in statement.lower()
+                    for destination in (destinations or [])
+                    for statement in destination.get("statements") or []
+                )
+                and all(
+                    self._is_safe_text_jsonb_record_recipe(statement)
+                    for destination in (destinations or [])
+                    for statement in destination.get("statements") or []
+                    if "jsonb_to_record" in statement.lower()
+                )
+            )
             unsafe_candidates = [
                 candidate
                 for candidate in candidates
                 if (
                     str(candidate.get("schema_name") or "") != "pg_catalog"
-                    or str(candidate.get("volatility") or "") != "i"
+                    or (
+                        str(candidate.get("volatility") or "") != "i"
+                        and not (
+                            safe_text_jsonb_record
+                            and str(candidate.get("volatility") or "") == "s"
+                        )
+                    )
                     or bool(candidate.get("security_definer"))
                     or str(candidate.get("function_kind") or "") == "p"
                 )
