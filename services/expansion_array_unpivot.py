@@ -78,7 +78,7 @@ def rewrite_array_unpivot(statement: str) -> str | None:
         "         u.kind AS type_text,\n"
         "         u.weight AS weight_text,\n"
         "         u.gap AS gap_text\n"
-        "  FROM pg_catalog.unnest(\n"
+        "  FROM unnest(\n"
         "       " + array_column("smallint", 1) + ",\n"
         "       " + array_column("text", 2) + ",\n"
         "       " + array_column("numeric", 3) + ",\n"
