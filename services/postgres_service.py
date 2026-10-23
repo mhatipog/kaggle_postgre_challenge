@@ -3,6 +3,7 @@ import csv
 import hashlib
 import io
 import json
+import os
 import re
 import shlex
 import sys
