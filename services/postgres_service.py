@@ -14137,7 +14137,7 @@ FROM pg_temp.pgdm_expansion_timings;
             # both inserted rows and the DDL.  Off unless explicitly enabled.
             bulk_fk_prepare_sql = ""
             bulk_fk_restore_sql = ""
-            if os.getenv("PDM_EXPANSION_BULK_FK_REBUILD", "0") == "1":
+            if os.getenv("PDM_EXPANSION_BULK_CONSTRAINT_REBUILD", "0") == "1":
                 table_identifiers = [
                     f"{sql_ident(d['schema_name'])}.{sql_ident(d['pure_table_name'])}"
                     for d in prepared["destinations"]
@@ -14151,10 +14151,11 @@ FROM pg_temp.pgdm_expansion_timings;
                     for identifier in table_identifiers
                 )
                 bulk_fk_prepare_sql = f"""
-CREATE TEMP TABLE pgdm_bulk_saved_foreign_keys (
+CREATE TEMP TABLE pgdm_bulk_saved_constraints (
     table_name text NOT NULL,
     constraint_name text NOT NULL,
-    definition text NOT NULL
+    definition text NOT NULL,
+    constraint_type text NOT NULL
 ) ON COMMIT DROP;
 DO $pgdm_bulk$
 DECLARE current_fk record;
@@ -14163,16 +14164,18 @@ BEGIN
         FOR current_fk IN
             SELECT con.conrelid::regclass::text AS table_name,
                    con.conname AS constraint_name,
-                   pg_get_constraintdef(con.oid) AS definition
+                   pg_get_constraintdef(con.oid) AS definition,
+                   con.contype::text AS constraint_type
             FROM pg_constraint AS con
-            WHERE con.contype = 'f'
+            WHERE con.contype IN ('f', 'u')
               AND con.conrelid IN ({registered_tables})
-            ORDER BY con.conrelid, con.conname
+            ORDER BY CASE WHEN con.contype='f' THEN 0 ELSE 1 END,
+                     con.conrelid, con.conname
         LOOP
-            INSERT INTO pg_temp.pgdm_bulk_saved_foreign_keys
-                (table_name, constraint_name, definition)
+            INSERT INTO pg_temp.pgdm_bulk_saved_constraints
+                (table_name, constraint_name, definition, constraint_type)
             VALUES (current_fk.table_name, current_fk.constraint_name,
-                    current_fk.definition);
+                    current_fk.definition, current_fk.constraint_type);
             EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I',
                            current_fk.table_name, current_fk.constraint_name);
         END LOOP;
@@ -14186,8 +14189,9 @@ DECLARE current_fk record;
 BEGIN
     FOR current_fk IN
         SELECT table_name, constraint_name, definition
-        FROM pg_temp.pgdm_bulk_saved_foreign_keys
-        ORDER BY table_name, constraint_name
+        FROM pg_temp.pgdm_bulk_saved_constraints
+        ORDER BY CASE WHEN constraint_type='u' THEN 0 ELSE 1 END,
+                 table_name, constraint_name
     LOOP
         EXECUTE format('ALTER TABLE %s ADD CONSTRAINT %I %s',
                        current_fk.table_name, current_fk.constraint_name,
