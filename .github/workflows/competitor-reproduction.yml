@@ -22,6 +22,7 @@ jobs:
       PDM_EXPANSION_SINGLE_PASS_STAGE: '1'
       PDM_EXPANSION_TYPED_STAGE: '1'
       PDM_EXPANSION_PG_TUNING: '1'
+      PDM_EXPANSION_PRUNE_STAGE_META: '1'
     steps:
       - name: Checkout our candidate
         uses: actions/checkout@v4
