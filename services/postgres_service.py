@@ -14232,6 +14232,28 @@ BEGIN
 END
 $pgdm_bulk$;
 """
+            # Experimental, challenge-only PK index bulk rebuild. The standard
+            # default keeps primary-key indexes in place. For empty destinations,
+            # FKs and UNIQUE constraints are already removed transactionally;
+            # drop/rebuild destination PKs in the *same transaction* to avoid
+            # maintaining millions of identity indexes row-by-row. PostgreSQL
+            # revalidates every PK before COMMIT, and any missing external FK
+            # dependency makes DROP fail and rolls the entire expansion back.
+            if (
+                competition_fastpath
+                and os.getenv("PDM_EXPANSION_REBUILD_PRIMARY_KEYS", "0") == "1"
+                and bulk_fk_prepare_sql
+                and bulk_fk_restore_sql
+            ):
+                bulk_fk_prepare_sql = bulk_fk_prepare_sql.replace(
+                    "con.contype IN ('f', 'u')",
+                    "con.contype IN ('f', 'u', 'p')",
+                )
+                bulk_fk_restore_sql = bulk_fk_restore_sql.replace(
+                    "CASE WHEN constraint_type='u' THEN 0 ELSE 1 END",
+                    "CASE constraint_type WHEN 'p' THEN 0 "
+                    "WHEN 'u' THEN 1 ELSE 2 END",
+                )
             projection_sql = ""
             if projection_plan is not None:
                 projection_sql = (
