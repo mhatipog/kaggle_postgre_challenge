@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import warnings
 from contextlib import contextmanager
 from datetime import datetime
@@ -58,6 +59,8 @@ CONTROL_TABLE_VERSION_DEPENDENCIES = (
     f"{CONTROL_SCHEMA_IDENT}.{sql_ident('table_version_dependencies')}"
 )
 DATA_TABLE_ROW_COUNTS_NAME = "pgdm_table_row_counts"
+EXPANSION_JOURNAL_TABLE = "pgdm_runtime.expansion_commits"
+EXPANSION_RECEIPT_TABLE = f"{CONTROL_SCHEMA_IDENT}.{sql_ident('expansion_receipts')}"
 DATA_TABLE_ROW_COUNTS = f"{sql_ident('public')}.{sql_ident(DATA_TABLE_ROW_COUNTS_NAME)}"
 LEGACY_CONTROL_TABLE_VERSIONS = f"{sql_ident(LEGACY_CONTROL_SCHEMA)}.{sql_ident('table_versions')}"
 LEGACY_CONTROL_TABLE_DELETE_AUDIT = f"{sql_ident(LEGACY_CONTROL_SCHEMA)}.{sql_ident('delete_audit')}"
@@ -13794,6 +13797,7 @@ BEGIN
 END
 $pgdm_expansion_scope$;
 
+CREATE TEMP TABLE pgdm_expansion_manifest_payload ON COMMIT DROP AS
 SELECT json_build_object(
     'raw_schemas', to_json({expected_scope_array}),
     'expected_row_count', COALESCE((
@@ -13837,7 +13841,8 @@ SELECT json_build_object(
           AND attribute.attnum > 0
           AND NOT attribute.attisdropped
     ), '[]'::json)
-)::text;
+)::jsonb AS payload;
+SELECT payload::text FROM pg_temp.pgdm_expansion_manifest_payload;
 """.strip()
 
     def execute_cross_table_expansion(
@@ -13850,6 +13855,8 @@ SELECT json_build_object(
         progress_callback=None,
         post_commit_callback=None,
         timing_report: dict | None = None,
+        requested_by: str | None = None,
+        workstation_name: str | None = None,
     ) -> dict:
         if timing_report is None:
             timing_report = self.create_cross_table_expansion_timing_report(
@@ -14014,6 +14021,22 @@ SELECT json_build_object(
         )
         self._raise_if_cancelled(cancel_event)
 
+        # This job id ties destination commit, outbox, and control-db receipt.
+        expansion_job_id = uuid.uuid4().hex
+        expansion_request = {
+            "expansion_job_id": expansion_job_id,
+            "source_database_name": database_name,
+            "source_schema_name": source_schema_name,
+            "source_table_name": source_table_name,
+            "raw_schemas": list(prepared["raw_schemas"]),
+            "source_versions": source_versions,
+            "destinations": prepared["destinations"],
+            "requested_by": str(requested_by or ""),
+            "workstation_name": str(workstation_name or ""),
+        }
+        expansion_request_json = sql_literal(
+            json.dumps(expansion_request, ensure_ascii=False, default=str)
+        )
         with self.expansion_timing_scope(
             timing_report,
             "prepare",
@@ -14052,6 +14075,28 @@ SELECT json_build_object(
             destination_lock_sql = self._build_cross_table_expansion_lock_sql(
                 prepared["destinations"]
             )
+            journal_table_sql = """
+CREATE SCHEMA IF NOT EXISTS pgdm_runtime;
+CREATE TABLE IF NOT EXISTS pgdm_runtime.expansion_commits (
+    job_id text PRIMARY KEY,
+    request_payload jsonb NOT NULL,
+    source_manifest jsonb NOT NULL,
+    committed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    finalized_at timestamptz
+);
+""".strip()
+            journal_commit_sql = (
+                "INSERT INTO pg_temp.pgdm_expansion_timings VALUES "
+                "(8990, 'execute', 'Record atomic expansion recovery marker', "
+                "clock_timestamp(), NULL, NULL, NULL, NULL);\n"
+                "INSERT INTO pgdm_runtime.expansion_commits "
+                "(job_id, request_payload, source_manifest) "
+                f"SELECT {sql_literal(expansion_job_id)}, "
+                f"{expansion_request_json}::jsonb, payload "
+                "FROM pg_temp.pgdm_expansion_manifest_payload;\n"
+                "UPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
+                "clock_timestamp() WHERE sequence_number = 8990;\n"
+            )
             timing_table_sql = """
 CREATE TEMP TABLE pgdm_expansion_timings (
     sequence_number integer PRIMARY KEY,
@@ -14086,7 +14131,9 @@ SELECT json_build_object(
 FROM pg_temp.pgdm_expansion_timings;
 """.strip()
             wrapped_sql = (
-                timing_table_sql
+                journal_table_sql
+                + "\n"
+                + timing_table_sql
                 + "\n\nBEGIN ISOLATION LEVEL REPEATABLE READ;\n"
                 + "INSERT INTO pg_temp.pgdm_expansion_timings VALUES "
                 + "(1, 'execute', 'Initialize database transaction', "
@@ -14107,6 +14154,7 @@ FROM pg_temp.pgdm_expansion_timings;
                 + "\nUPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
                 + "clock_timestamp() WHERE sequence_number = 3;\n\n"
                 + "\n\n".join(execution_statements)
+                + "\n\n" + journal_commit_sql
                 + "\n\nINSERT INTO pg_temp.pgdm_expansion_timings VALUES "
                 + "(9000, 'execute', 'Commit expansion transaction', "
                 + "clock_timestamp(), NULL, NULL, NULL, NULL);\n"
@@ -14221,6 +14269,7 @@ FROM pg_temp.pgdm_expansion_timings;
         )
 
         return {
+            "expansion_job_id": expansion_job_id,
             "source_database_name": database_name,
             "source_schema_name": source_schema_name,
             "source_table_name": source_table_name,
