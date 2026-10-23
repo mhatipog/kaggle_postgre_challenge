@@ -130,6 +130,18 @@ def main():
     (output_dir / (args.label + ".json")).write_text(
         json.dumps(record, indent=2, sort_keys=True), encoding="utf-8"
     )
+    if record.get("items"):
+        # The application's scored metric is distinct from validation wall time.
+        # Print the ten largest measured stages to guide controlled profiling.
+        stages = sorted(
+            (i for i in record["items"] if i.get("include_in_total", True)),
+            key=lambda item: float(item.get("seconds") or 0), reverse=True,
+        )[:10]
+        print("SCORED_STAGE_BREAKDOWN " + json.dumps([
+            {"name": item.get("name"), "stage": item.get("stage"),
+             "seconds": round(float(item.get("seconds") or 0), 4)}
+            for item in stages
+        ]), flush=True)
     print(json.dumps({
         "label": args.label,
         "measured_processing_total": record.get("measured_processing_total"),
