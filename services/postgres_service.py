@@ -14048,6 +14048,20 @@ SELECT payload::text FROM pg_temp.pgdm_expansion_manifest_payload;
                 projection_plan = specialize_typed_fields(
                     prepared, projection_plan, prune_unused_meta=competition_fastpath
                 )
+            if (
+                competition_fastpath
+                and projection_plan is not None
+                and projection_plan.get("typed_fields", 0) >= 40
+                and os.getenv("PDM_EXPANSION_ARRAY_UNPIVOT", "0") == "1"
+            ):
+                from services.expansion_array_unpivot import rewrite_array_unpivot
+                rewritten = rewrite_array_unpivot(
+                    projection_plan["rewritten_destinations"][5][0]
+                )
+                if rewritten is not None:
+                    compiled = [list(d) for d in projection_plan["rewritten_destinations"]]
+                    compiled[5][0] = rewritten
+                    projection_plan = {**projection_plan, "rewritten_destinations": compiled}
 
         # This job id ties destination commit, outbox, and control-db receipt.
         expansion_job_id = uuid.uuid4().hex
