@@ -14108,6 +14108,46 @@ SELECT payload::text FROM pg_temp.pgdm_expansion_manifest_payload;
             destination_lock_sql = self._build_cross_table_expansion_lock_sql(
                 prepared["destinations"]
             )
+            # Opt-in performance experiment: reuse the materialized projection
+            # for the exact dependency manifest. The original source scope and
+            # version manifest format remain unchanged, and any unsupported
+            # layout safely falls back to the original full source scan.
+            manifest_from_stage = False
+            if (
+                competition_fastpath
+                and projection_plan is not None
+                and os.getenv("PDM_EXPANSION_MANIFEST_FROM_STAGE", "0") == "1"
+            ):
+                source_ref = (
+                    f"{sql_ident(source_schema_name)}.{sql_ident(source_table_name)}"
+                )
+                scope_sql = ", ".join(
+                    sql_literal(value) for value in prepared["raw_schemas"]
+                )
+                source_scan = (
+                    f"FROM {source_ref}\n"
+                    f"WHERE {sql_ident('raw_schema')} IN ({scope_sql})\n"
+                    "GROUP BY "
+                )
+                marker = "    s.raw_id,\n"
+                stage_sql = projection_plan["stage_sql"]
+                if manifest_sql.count(source_scan) == 1 and stage_sql.count(marker) == 1:
+                    # Keep original source raw_hash and raw_schema, without any
+                    # text cast or normalization, to preserve NULL grouping.
+                    stage_sql = stage_sql.replace(
+                        marker,
+                        marker + "    s.raw_schema,\n    s.raw_hash,\n",
+                        1,
+                    )
+                    projection_plan = {**projection_plan, "stage_sql": stage_sql}
+                    manifest_sql = manifest_sql.replace(
+                        source_scan,
+                        "FROM pg_temp.pgdm_source_stage\n"
+                        f"WHERE {sql_ident('raw_schema')} IN ({scope_sql})\n"
+                        "GROUP BY ",
+                        1,
+                    )
+                    manifest_from_stage = True
             journal_table_sql = """
 CREATE SCHEMA IF NOT EXISTS pgdm_runtime;
 CREATE TABLE IF NOT EXISTS pgdm_runtime.expansion_commits (
@@ -14266,13 +14306,14 @@ $pgdm_bulk$;
                 + destination_lock_sql
                 + "\nUPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
                 + "clock_timestamp() WHERE sequence_number = 2;\n\n"
+                + ("\n\n" + projection_sql if manifest_from_stage else "")
                 + "INSERT INTO pg_temp.pgdm_expansion_timings VALUES "
                 + "(3, 'execute', 'Scan source and build dependency manifest', "
                 + "clock_timestamp(), NULL, NULL, NULL, NULL);\n"
                 + manifest_sql
                 + "\nUPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
                 + "clock_timestamp() WHERE sequence_number = 3;\n\n"
-                + "\n\n" + projection_sql
+                + ("\n\n" + projection_sql if not manifest_from_stage else "")
                 + "\n\n" + bulk_fk_prepare_sql
                 + "\n\n".join(execution_statements)
                 + "\n\n" + bulk_fk_restore_sql
