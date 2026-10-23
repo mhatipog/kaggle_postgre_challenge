@@ -6,6 +6,7 @@ projection. No optimizer step may weaken the baseline SQL safety gate.
 """
 from __future__ import annotations
 
+import os
 import re
 
 from utils import sql_ident
@@ -100,6 +101,23 @@ def specialize_typed_fields(prepared: dict, plan: dict) -> dict:
             return plan
         stage_sql = stage_sql.replace(old, expr)
 
+    # Keep unused metadata out of the 64-field projection. This is an
+    # opt-in physical-layout optimization only: the protected source scope
+    # and the independently generated version manifest are unchanged.
+    if os.getenv("PDM_EXPANSION_PRUNE_STAGE_META", "0") == "1":
+        compiled_text = "\n".join(x for group in compiled for x in group)
+        for metadata_column in (
+            "raw_hash", "raw_schema", "raw_ingested_at", "raw_tab"
+        ):
+            if re.search(
+                rf"\bsource_row\s*\.\s*{metadata_column}\b",
+                compiled_text, flags=re.IGNORECASE,
+            ):
+                continue
+            old_projection = f"    s.{metadata_column},\n"
+            if stage_sql.count(old_projection) != 1:
+                return plan
+            stage_sql = stage_sql.replace(old_projection, "")
     return {
         **plan,
         "stage_sql": stage_sql,
