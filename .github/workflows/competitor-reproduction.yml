@@ -58,9 +58,15 @@ jobs:
         working-directory: ours
         run: |
           python generate_database.py --rows "$BENCH_ROWS" --host 127.0.0.1 --postgres_port 5432 --user kaggle_ci --admin_database postgres
+      - name: Snapshot original FK, unique and index definitions
+        working-directory: ours
+        run: python benchmarks/assert_schema_invariants.py --file ../benchmark_comparison/schema_before.json
       - name: Our current solution full pipeline
         working-directory: ours
         run: python benchmarks/headless_e2e.py --label our_candidate --out-dir ../benchmark_comparison
+      - name: Confirm all FK constraints and indexes restored after COMMIT
+        working-directory: ours
+        run: python benchmarks/assert_schema_invariants.py --file ../benchmark_comparison/schema_before.json --verify
       - name: Reset destinations and versions without changing raw data
         working-directory: competitor
         run: python benchmarks/reset_challenge.py
@@ -116,6 +122,9 @@ jobs:
                   f.write(f"| {mode} | {value:.3f} |\n")
               f.write("\nOutput parity: **PASS** (six destinations)\n")
           PY
+      - name: Failure injection and durable post-commit recovery with optimization enabled
+        working-directory: ours
+        run: python benchmarks/test_recovery_integration.py --user kaggle_ci
       - name: Upload all benchmark evidence
         if: always()
         uses: actions/upload-artifact@v4
