@@ -14235,6 +14235,13 @@ $pgdm_bulk$;
                 + "(1, 'execute', 'Initialize database transaction', "
                 + "clock_timestamp(), NULL, NULL, NULL, NULL);\n"
                 + "SET LOCAL client_min_messages = warning;\n"
+                + (
+                    "SET LOCAL jit = off;\n"
+                    "SET LOCAL work_mem = '64MB';\n"
+                    "SET LOCAL maintenance_work_mem = '128MB';\n"
+                    if os.getenv("PDM_EXPANSION_PG_TUNING", "0") == "1"
+                    else ""
+                )
                 + "UPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
                 + "clock_timestamp() WHERE sequence_number = 1;\n\n"
                 + "INSERT INTO pg_temp.pgdm_expansion_timings VALUES "
