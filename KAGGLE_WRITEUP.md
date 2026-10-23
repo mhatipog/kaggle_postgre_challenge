@@ -29,14 +29,16 @@ The reported metric is the application's measured processing total (not just EXP
 |---:|---:|---:|---:|---:|
 | 100,000 | 12.109 s | 10.713 s | **5.783 s** | 46.0% lower time |
 | 1,000,000 | 83.858 s | 30.483 s | **26.840 s** | 12.0% lower time |
+| 1,000,000 (final default release, no flags) | 129.150 s | 45.417 s | **40.587 s** | 10.6% lower time |
 | 3,000,000 | 343.913 s | 121.637 s | **107.176 s** | 11.9% lower time |
 
-These are separate controlled experiments and should not be interpreted as repeated trials on identical hardware. We make no claim of 300-million-row validation or superiority to non-public submissions.
+These are separate controlled experiments and should not be interpreted as repeated trials on identical hardware. The **final release-default 1M run** is intentionally included separately because runner performance differs; it proves that the same optimization activates through the ordinary application service without manually set experiment flags. We make no claim of 300-million-row validation or superiority to non-public submissions.
 
 **Primary reproducible evidence:**
 - [100k typed-stage comparison (passing)](https://github.com/mhatipog/kaggle_postgre_challenge/actions/runs/39930589692)
 - [1M metadata-pruned typed-stage comparison (passing)](https://github.com/mhatipog/kaggle_postgre_challenge/actions/runs/39931251847)
 - [3M metadata-pruned typed-stage comparison (passing)](https://github.com/mhatipog/kaggle_postgre_challenge/actions/runs/39932278207)
+- [Final release 1M comparison — no optimization environment switches; output, schema and crash-recovery checks passing](https://github.com/mhatipog/kaggle_postgre_challenge/actions/runs/39938033053)
 - `.github/workflows/competitor-reproduction.yml` is a self-contained public re-run and should show the verified release-default path, with all output checks.
 
 The CI benchmark exercises the actual service methods via SSH/psql, not a rewritten SQL-only approximation. It does not exercise interactive Windows GUI actions or remote-network packet loss during live SSH.
