@@ -33,12 +33,12 @@ jobs:
           sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE kaggle_ci WITH LOGIN CREATEDB PASSWORD '$password';"
           echo "PGPASSWORD=$password" >> "$GITHUB_ENV"
           echo "PG_KAGGLE_CHALLENGE_PASS=$password" >> "$GITHUB_ENV"
-      - name: Generate official 10,000-row challenge database (unchanged generator)
+      - name: Generate official 100,000-row challenge database (unchanged generator)
         run: |
-          python generate_database.py --rows 10000 --host 127.0.0.1 --postgres_port 5432 --user kaggle_ci --admin_database postgres
+          python generate_database.py --rows 100000 --host 127.0.0.1 --postgres_port 5432 --user kaggle_ci --admin_database postgres
       - name: Benchmark baseline and candidate on identical official data
         run: |
-          python benchmarks/compare_sql.py --host 127.0.0.1 --user kaggle_ci --out benchmark_results.json
+          python benchmarks/compare_sql.py --host 127.0.0.1 --user kaggle_ci --repeats 2 --out benchmark_results.json
       - name: Upload metrics for inspection
         if: always()
         uses: actions/upload-artifact@v4
