@@ -15213,6 +15213,26 @@ LIMIT {int(limit)};
                 "The expansion result does not contain complete destinations or a manifest."
             )
 
+        expansion_job_id = str(
+            (expansion_result or {}).get("expansion_job_id") or ""
+        ).strip()
+        if expansion_job_id:
+            prior_versions = self._get_committed_expansion_receipt(
+                database_name, expansion_job_id
+            )
+            if prior_versions is not None:
+                expected_tables = [
+                    str(destination.get("table_name") or "").strip()
+                    for destination in destinations
+                ]
+                version_map = {row["table_name"]: row for row in prior_versions}
+                if set(version_map) != set(expected_tables):
+                    raise RuntimeError(
+                        "Committed expansion receipt has incomplete destination versions."
+                    )
+                self._finalize_expansion_journal(database_name, expansion_job_id)
+                return [version_map[name] for name in expected_tables]
+
         source_full_table_name = f"{source_schema_name}.{source_table_name}"
         source_versions = self._canonical_source_version_references(
             (expansion_result or {}).get("source_versions")
@@ -15265,6 +15285,22 @@ CREATE TEMP TABLE pgdm_expansion_timings (
                 f"{CONTROL_SCHEMA}.table_versions:"
                 f"{database_name}:{schema_name}:{table_name}"
             )
+        if expansion_job_id:
+            # One registration attempt per committed data job, even if two
+            # clients try to recover simultaneously after an SSH disconnect.
+            lock_key = "pgdm_expansion_job:" + expansion_job_id
+            sql_parts.append(
+                "SELECT pg_advisory_xact_lock(hashtextextended("
+                f"{sql_literal(lock_key)}, 0));\n"
+                "DO $pgdm_expansion_receipt$\n"
+                "BEGIN\n"
+                f"IF EXISTS (SELECT 1 FROM {EXPANSION_RECEIPT_TABLE} "
+                f"WHERE job_id = {sql_literal(expansion_job_id)}) THEN\n"
+                "RAISE EXCEPTION 'Expansion version receipt already exists; retry recovery';\n"
+                "END IF;\n"
+                "END\n"
+                "$pgdm_expansion_receipt$;"
+            )
         timing_sequence = 1
         for lock_key in sorted(destination_lock_keys):
             lock_table_name = lock_key.rsplit(":", 1)[-1]
@@ -15314,6 +15350,8 @@ CREATE TEMP TABLE pgdm_expansion_timings (
                 )
 
             dependency_payload = dict(base_manifest)
+            if expansion_job_id:
+                dependency_payload["expansion_job_id"] = expansion_job_id
             dependency_payload["destination_columns"] = destination_columns
             dependency_payload[
                 "destination_read_relations"
@@ -15434,6 +15472,13 @@ FROM inserted_version;
             normalized_destinations.append(full_table_name)
             version_statement_sequence += 1
 
+        if expansion_job_id:
+            # Durable receipt is in the SAME control-database transaction as
+            # the version rows and their dependency manifests.
+            sql_parts.append(
+                f"INSERT INTO {EXPANSION_RECEIPT_TABLE} (job_id) "
+                f"VALUES ({sql_literal(expansion_job_id)});"
+            )
         sql_parts.extend(
             [
                 """
@@ -15573,6 +15618,8 @@ DROP TABLE pg_temp.pgdm_expansion_timings;
                 + "."
             )
 
+        if expansion_job_id:
+            self._finalize_expansion_journal(database_name, expansion_job_id)
         self._notify_progress(
             progress_callback,
             "version",
