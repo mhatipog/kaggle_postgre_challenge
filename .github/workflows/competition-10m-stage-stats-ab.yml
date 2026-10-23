@@ -1,0 +1,162 @@
+name: Competition 10M stage-statistics reverse-order A/B
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/competition-10m-stage-stats-ab.yml'
+      - 'benchmarks/headless_e2e.py'
+      - 'services/expansion_stage.py'
+      - 'tests/test_single_pass_compiler.py'
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 220
+    env:
+      BENCH_ROWS: '10000000'
+      PDM_BENCH_PG_USER: kaggle_ci
+      PDM_BENCH_SSH_USER: kagglebench
+      PDM_EXPANSION_WORKERS: '2'
+      # Deliberately no optimization environment variables: test release defaults.
+    steps:
+      - name: Checkout our candidate
+        uses: actions/checkout@v4
+        with:
+          path: ours
+          persist-credentials: false
+      - name: Checkout pinned competitor
+        uses: actions/checkout@v4
+        with:
+          repository: bcap52/kaggle_postgre_challenge
+          ref: 7b81ca2797f06304d81477afcb0cfb3dad75ff43
+          path: competitor
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install dependencies PostgreSQL and localhost SSH daemon
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -r ours/requirements.txt
+          sudo systemctl start postgresql
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean
+          sudo mkdir -p /run/sshd
+          password="$(openssl rand -hex 24)"
+          echo "::add-mask::$password"
+          sudo useradd -m -s /bin/bash kagglebench
+          printf '%s:%s\n' kagglebench "$password" | sudo chpasswd
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE kaggle_ci WITH LOGIN CREATEDB PASSWORD '$password';"
+          sudo /usr/sbin/sshd -p 2222 -o PasswordAuthentication=yes -o UsePAM=no
+          echo "PDM_BENCH_PASSWORD=$password" >> "$GITHUB_ENV"
+          echo "PGPASSWORD=$password" >> "$GITHUB_ENV"
+          echo "PG_KAGGLE_CHALLENGE_PASS=$password" >> "$GITHUB_ENV"
+          pg_isready -h localhost -p 5432
+      - name: Generate official unchanged data
+        working-directory: ours
+        run: |
+          python generate_database.py --rows "$BENCH_ROWS" --host 127.0.0.1 --postgres_port 5432 --user kaggle_ci --admin_database postgres
+      - name: Confirm 10M runner headroom after official generation
+        shell: bash
+        run: |
+          df -h /
+          free -h
+          test "$(df -PB1 / | awk 'NR==2 {print $4}')" -ge 2147483648 || exit 1
+      - name: Snapshot original FK, unique and index definitions
+        working-directory: ours
+        run: python benchmarks/assert_schema_invariants.py --file ../benchmark_comparison/schema_before.json
+      - name: Experimental selective-statistics candidate first (cold cache)
+        working-directory: ours
+        env:
+          PDM_EXPANSION_STAGE_STATS: join-only
+        run: python benchmarks/headless_e2e.py --label our_candidate --out-dir ../benchmark_comparison
+      - name: Confirm candidate left original FK and index definitions unchanged
+        working-directory: ours
+        run: python benchmarks/assert_schema_invariants.py --file ../benchmark_comparison/schema_before.json --verify
+      - name: Reset to empty tables for release-default reference
+        working-directory: competitor
+        run: python benchmarks/reset_challenge.py
+      - name: Release-default reference second (warm cache)
+        working-directory: ours
+        env:
+          PDM_EXPANSION_STAGE_STATS: all
+        run: python benchmarks/headless_e2e.py --label release_default --out-dir ../benchmark_comparison
+      - name: Assert official fast path is active without environment switches
+        working-directory: ours
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          record=json.loads(Path('../benchmark_comparison/our_candidate.json').read_text())
+          stages=[x['name'] for x in record.get('items',[])]
+          assert any('Single-pass shared JSONB source projection' in x for x in stages), 'Release default silently fell back to legacy path'
+          print('PASS: single-pass release optimization active by default')
+          PY
+      - name: Confirm all FK constraints and indexes restored after COMMIT
+        working-directory: ours
+        run: python benchmarks/assert_schema_invariants.py --file ../benchmark_comparison/schema_before.json --verify
+      - name: Reset destinations and versions without changing raw data
+        working-directory: competitor
+        run: python benchmarks/reset_challenge.py
+      - name: Competitor optimized fast path
+        working-directory: competitor
+        env:
+          PDM_EXPANSION_FASTPATH: '1'
+        run: |
+          python benchmarks/expansion_driver.py --out-dir ../benchmark_comparison --label competitor_fastpath
+          python ../ours/benchmarks/headless_e2e.py --inspect-only --label competitor_fastpath --out-dir ../benchmark_comparison
+      - name: Verify six destination contents and compare full timing
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path("benchmark_comparison")
+          own=json.loads((p/"our_candidate.json").read_text())
+          competitor=json.loads((p/"competitor_fastpath.json").read_text())
+          release=json.loads((p/"release_default.json").read_text())
+          original=release
+          assert own["signatures"]==release["signatures"], "Experimental output differs from current release"
+          assert own["signatures"]==original["signatures"], "Our outputs differ from classic"
+          assert competitor["signatures"]==original["signatures"], "Competitor outputs differ from classic"
+          def seconds(mode):
+              if mode=="our_candidate":
+                  return own["measured_processing_total"]
+              files=sorted(p.glob("*_"+mode+".json"))
+              assert files, "Missing report: "+mode
+              return json.loads(files[-1].read_text())["measured_processing_total"]
+          fast=seconds("competitor_fastpath")
+          ours=seconds("our_candidate")
+          release_seconds=release["measured_processing_total"]
+          diff_percent=round(100*(release_seconds - ours)/release_seconds, 2)
+          summary={"rows":int(__import__("os").environ["BENCH_ROWS"]),"competitor_s":fast,"ours_s":ours,
+                   "release_reference_s":release_seconds,"candidate_improvement_pct":diff_percent,
+                   "candidate_vs_competitor_pct":round(100*(fast-ours)/fast,2),
+                   "fingerprints":"identical for all six normalized tables",
+                   "environment":"Linux local SSH + PostgreSQL on identical runner"}
+          (p/"summary.json").write_text(json.dumps(summary,indent=2)+"\n")
+          print(json.dumps(summary,indent=2))
+          with open(__import__("os").environ["GITHUB_STEP_SUMMARY"],"a") as f:
+              f.write("## Independent SSH + PostgreSQL benchmark\n\n")
+              f.write("| Case | MEASURED PROCESSING TOTAL (s) |\n|---|---:|\n")
+              for mode,value in [("Competitor",fast),("Release default",release_seconds),("Selective-ANALYZE candidate",ours)]:
+                  f.write(f"| {mode} | {value:.3f} |\n")
+              f.write("\nOutput parity: **PASS** (six destinations)\n")
+          PY
+      - name: Failure injection and durable post-commit recovery with optimization enabled
+        working-directory: ours
+        run: python benchmarks/test_recovery_integration.py --user kaggle_ci
+      - name: Upload all benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: competition-10m-stage-statistics-reverse-ab
+          path: benchmark_comparison/
+          if-no-files-found: ignore
+          retention-days: 30

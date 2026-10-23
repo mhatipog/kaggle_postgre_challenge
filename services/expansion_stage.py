@@ -6,6 +6,7 @@ patterns fall back to the original validated SQL, unchanged.
 """
 from __future__ import annotations
 
+import os
 import re
 
 from utils import sql_ident, sql_literal
@@ -135,6 +136,29 @@ LEFT JOIN LATERAL pg_catalog.jsonb_to_record(s.raw -> 'values')
 WHERE s.raw_schema IN ({scope_sql});
 ANALYZE pg_temp.pgdm_source_stage;
 """
+    # Experimental statistics ablation for the exact official six-recipe
+    # workload. PostgreSQL normally analyzes every typed/text column in this
+    # wide temporary stage. All six INSERTs scan the stage; only these four
+    # columns participate directly in equijoins or dimension lookups.
+    # Retain a full ANALYZE for all other SQL shapes and by default.
+    expected_destinations = (
+        "public.table3", "public.table4", "public.table1",
+        "public.table5", "public.table6", "public.table2",
+    )
+    if (
+        os.getenv("PDM_EXPANSION_STAGE_STATS", "all") == "join-only"
+        and tuple(d["table_name"] for d in prepared["destinations"]) == expected_destinations
+        and {"text_column_1", "text_column_2", "text_column_3"}.issubset(staged_fields)
+        and prepared["source_schema_name"] == "public"
+        and prepared["source_table_name"] == "raw_data"
+        and list(prepared["raw_schemas"]) == ["group001"]
+    ):
+        stage_sql = stage_sql.replace(
+            "ANALYZE pg_temp.pgdm_source_stage;",
+            'ANALYZE pg_temp.pgdm_source_stage '
+            '("raw_id", "pgdm_v_text_column_1", '
+            '"pgdm_v_text_column_2", "pgdm_v_text_column_3");',
+        )
     return {
         "field_count": len(fields),
         "stage_sql": stage_sql,

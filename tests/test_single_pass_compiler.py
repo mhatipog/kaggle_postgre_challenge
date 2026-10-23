@@ -49,6 +49,19 @@ class SinglePassSourceTest(unittest.TestCase):
                 self.assertNotRegex(statement, r"\bsource_row\.raw\b")
                 self.assertNotIn("extracted.", statement)
 
+    def test_stage_statistics_opt_in_only_and_safe_fallback(self):
+        prepared = self.make_prepared()
+        default = plan_single_pass_projection(prepared, self.source_columns())
+        self.assertIn("ANALYZE pg_temp.pgdm_source_stage;", default["stage_sql"])
+        with patch.dict("os.environ", {"PDM_EXPANSION_STAGE_STATS": "join-only"}):
+            specialized = plan_single_pass_projection(prepared, self.source_columns())
+        self.assertIn('"raw_id", "pgdm_v_text_column_1"', specialized["stage_sql"])
+        self.assertNotIn("ANALYZE pg_temp.pgdm_source_stage;", specialized["stage_sql"])
+        prepared["raw_schemas"] = ["another_scope"]
+        with patch.dict("os.environ", {"PDM_EXPANSION_STAGE_STATS": "join-only"}):
+            fallback = plan_single_pass_projection(prepared, self.source_columns())
+        self.assertIsNone(fallback, "Unexpected source scope must fail safe")
+
     def test_typed_specialization_preserves_validated_structure(self):
         prepared = self.make_prepared()
         original = plan_single_pass_projection(prepared, self.source_columns())
