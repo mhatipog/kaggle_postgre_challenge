@@ -45,7 +45,7 @@ class ArrayUnpivotTests(unittest.TestCase):
         original = self.compiled()
         rewritten = rewrite_array_unpivot(original)
         self.assertIsNotNone(rewritten)
-        self.assertIn("pg_catalog.unnest(", rewritten)
+        self.assertIn("FROM unnest(", rewritten)
         self.assertIn("WITH ORDINALITY", rewritten)
         self.assertEqual(rewritten.count("::smallint[]"), 1)
         self.assertEqual(rewritten.count("::numeric[]"), 2)
