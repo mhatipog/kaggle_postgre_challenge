@@ -199,7 +199,7 @@ def main() -> None:
         ):
             marker = "INSERT INTO pg_temp.pgdm_expansion_timings VALUES (9000"
             assert marker in stdin_text
-            stdin_text = stdin_text.replace(marker, "SELECT 1 / 0;\\n" + marker, 1)
+            stdin_text = stdin_text.replace(marker, "SELECT 1 / 0;\n" + marker, 1)
         return real_remote(command, stdin_text=stdin_text, **kwargs)
 
     failing.run_remote_command = force_precommit_error
