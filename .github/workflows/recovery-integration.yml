@@ -1,0 +1,35 @@
+name: Recovery crash-gap integration (official 3k dataset)
+
+on:
+  pull_request:
+    branches: [competition/jsonb-record-optimization]
+  workflow_dispatch:
+
+jobs:
+  recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies and start PostgreSQL
+        run: |
+          python -m pip install -r requirements.txt
+          sudo systemctl start postgresql
+      - name: Create local-only test credentials
+        shell: bash
+        run: |
+          password="$(openssl rand -hex 24)"
+          echo "::add-mask::$password"
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE kaggle_ci WITH LOGIN CREATEDB PASSWORD '$password';"
+          echo "PGPASSWORD=$password" >> "$GITHUB_ENV"
+          echo "PG_KAGGLE_CHALLENGE_PASS=$password" >> "$GITHUB_ENV"
+      - name: Generate unmodified official challenge data
+        run: |
+          python generate_database.py --rows 3000 --host 127.0.0.1 --postgres_port 5432 --user kaggle_ci --admin_database postgres
+      - name: Execute six-destination expansion and simulated crash recovery
+        run: |
+          python benchmarks/test_recovery_integration.py --user kaggle_ci
