@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import warnings
 from contextlib import contextmanager
 from datetime import datetime
@@ -58,6 +59,8 @@ CONTROL_TABLE_VERSION_DEPENDENCIES = (
     f"{CONTROL_SCHEMA_IDENT}.{sql_ident('table_version_dependencies')}"
 )
 DATA_TABLE_ROW_COUNTS_NAME = "pgdm_table_row_counts"
+EXPANSION_JOURNAL_TABLE = "pgdm_runtime.expansion_commits"
+EXPANSION_RECEIPT_TABLE = f"{CONTROL_SCHEMA_IDENT}.{sql_ident('expansion_receipts')}"
 DATA_TABLE_ROW_COUNTS = f"{sql_ident('public')}.{sql_ident(DATA_TABLE_ROW_COUNTS_NAME)}"
 LEGACY_CONTROL_TABLE_VERSIONS = f"{sql_ident(LEGACY_CONTROL_SCHEMA)}.{sql_ident('table_versions')}"
 LEGACY_CONTROL_TABLE_DELETE_AUDIT = f"{sql_ident(LEGACY_CONTROL_SCHEMA)}.{sql_ident('delete_audit')}"
@@ -13794,6 +13797,7 @@ BEGIN
 END
 $pgdm_expansion_scope$;
 
+CREATE TEMP TABLE pgdm_expansion_manifest_payload ON COMMIT DROP AS
 SELECT json_build_object(
     'raw_schemas', to_json({expected_scope_array}),
     'expected_row_count', COALESCE((
@@ -13837,7 +13841,8 @@ SELECT json_build_object(
           AND attribute.attnum > 0
           AND NOT attribute.attisdropped
     ), '[]'::json)
-)::text;
+)::jsonb AS payload;
+SELECT payload::text FROM pg_temp.pgdm_expansion_manifest_payload;
 """.strip()
 
     def execute_cross_table_expansion(
@@ -13850,6 +13855,8 @@ SELECT json_build_object(
         progress_callback=None,
         post_commit_callback=None,
         timing_report: dict | None = None,
+        requested_by: str | None = None,
+        workstation_name: str | None = None,
     ) -> dict:
         if timing_report is None:
             timing_report = self.create_cross_table_expansion_timing_report(
@@ -14014,6 +14021,22 @@ SELECT json_build_object(
         )
         self._raise_if_cancelled(cancel_event)
 
+        # This job id ties destination commit, outbox, and control-db receipt.
+        expansion_job_id = uuid.uuid4().hex
+        expansion_request = {
+            "expansion_job_id": expansion_job_id,
+            "source_database_name": database_name,
+            "source_schema_name": source_schema_name,
+            "source_table_name": source_table_name,
+            "raw_schemas": list(prepared["raw_schemas"]),
+            "source_versions": source_versions,
+            "destinations": prepared["destinations"],
+            "requested_by": str(requested_by or ""),
+            "workstation_name": str(workstation_name or ""),
+        }
+        expansion_request_json = sql_literal(
+            json.dumps(expansion_request, ensure_ascii=False, default=str)
+        )
         with self.expansion_timing_scope(
             timing_report,
             "prepare",
@@ -14052,6 +14075,28 @@ SELECT json_build_object(
             destination_lock_sql = self._build_cross_table_expansion_lock_sql(
                 prepared["destinations"]
             )
+            journal_table_sql = """
+CREATE SCHEMA IF NOT EXISTS pgdm_runtime;
+CREATE TABLE IF NOT EXISTS pgdm_runtime.expansion_commits (
+    job_id text PRIMARY KEY,
+    request_payload jsonb NOT NULL,
+    source_manifest jsonb NOT NULL,
+    committed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    finalized_at timestamptz
+);
+""".strip()
+            journal_commit_sql = (
+                "INSERT INTO pg_temp.pgdm_expansion_timings VALUES "
+                "(8990, 'execute', 'Record atomic expansion recovery marker', "
+                "clock_timestamp(), NULL, NULL, NULL, NULL);\n"
+                "INSERT INTO pgdm_runtime.expansion_commits "
+                "(job_id, request_payload, source_manifest) "
+                f"SELECT {sql_literal(expansion_job_id)}, "
+                f"{expansion_request_json}::jsonb, payload "
+                "FROM pg_temp.pgdm_expansion_manifest_payload;\n"
+                "UPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
+                "clock_timestamp() WHERE sequence_number = 8990;\n"
+            )
             timing_table_sql = """
 CREATE TEMP TABLE pgdm_expansion_timings (
     sequence_number integer PRIMARY KEY,
@@ -14086,7 +14131,9 @@ SELECT json_build_object(
 FROM pg_temp.pgdm_expansion_timings;
 """.strip()
             wrapped_sql = (
-                timing_table_sql
+                journal_table_sql
+                + "\n"
+                + timing_table_sql
                 + "\n\nBEGIN ISOLATION LEVEL REPEATABLE READ;\n"
                 + "INSERT INTO pg_temp.pgdm_expansion_timings VALUES "
                 + "(1, 'execute', 'Initialize database transaction', "
@@ -14107,6 +14154,7 @@ FROM pg_temp.pgdm_expansion_timings;
                 + "\nUPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
                 + "clock_timestamp() WHERE sequence_number = 3;\n\n"
                 + "\n\n".join(execution_statements)
+                + "\n\n" + journal_commit_sql
                 + "\n\nINSERT INTO pg_temp.pgdm_expansion_timings VALUES "
                 + "(9000, 'execute', 'Commit expansion transaction', "
                 + "clock_timestamp(), NULL, NULL, NULL, NULL);\n"
@@ -14221,6 +14269,7 @@ FROM pg_temp.pgdm_expansion_timings;
         )
 
         return {
+            "expansion_job_id": expansion_job_id,
             "source_database_name": database_name,
             "source_schema_name": source_schema_name,
             "source_table_name": source_table_name,
@@ -15004,6 +15053,123 @@ COMMIT;
             ]
         )
 
+    def _get_committed_expansion_receipt(
+        self, database_name: str, expansion_job_id: str,
+    ) -> list[dict] | None:
+        """Return an existing atomic control-db receipt; None means unregistered.
+
+        Store the receipt and destination version/dependency rows in the same
+        control-database transaction so a lost SSH response is retry-safe.
+        """
+        sql = f"""
+CREATE TABLE IF NOT EXISTS {EXPANSION_RECEIPT_TABLE} (
+    job_id text PRIMARY KEY,
+    registered_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+SELECT json_build_object(
+    'exists', EXISTS (
+        SELECT 1 FROM {EXPANSION_RECEIPT_TABLE}
+        WHERE job_id = {sql_literal(expansion_job_id)}
+    ),
+    'versions', COALESCE((
+        SELECT json_agg(
+            json_build_object(
+                'table_name', versions.schema_name || '.' || versions.table_name,
+                'version_code', versions.version_code,
+                'dependency_count', 1
+            )
+            ORDER BY versions.schema_name, versions.table_name
+        )
+        FROM {CONTROL_TABLE_VERSIONS} AS versions
+        JOIN {CONTROL_TABLE_VERSION_DEPENDENCIES} AS deps
+          ON deps.table_version_id = versions.id
+        WHERE deps.dependency_payload ->> 'expansion_job_id'
+              = {sql_literal(expansion_job_id)}
+          AND versions.database_name = {sql_literal(database_name)}
+    ), '[]'::json)
+)::text;
+""".strip()
+        command = (
+            f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+            f"-d {shlex.quote(CONTROL_DB)} -X -qAt -v ON_ERROR_STOP=1 "
+            f"-c {shlex.quote(sql)}"
+        )
+        output = self.run_remote_command(command).strip()
+        record = json.loads(output.splitlines()[-1])
+        if not record.get("exists"):
+            return None
+        versions = list(record.get("versions") or [])
+        if not versions:
+            raise RuntimeError(
+                "Expansion receipt exists but its registered versions are missing."
+            )
+        return versions
+
+    def _finalize_expansion_journal(
+        self, database_name: str, expansion_job_id: str,
+    ) -> None:
+        sql = (
+            f"UPDATE {EXPANSION_JOURNAL_TABLE} SET "
+            "finalized_at = COALESCE(finalized_at, clock_timestamp()) "
+            f"WHERE job_id = {sql_literal(expansion_job_id)};"
+        )
+        command = (
+            f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+            f"-d {shlex.quote(database_name)} -X -qAt -v ON_ERROR_STOP=1 "
+            f"-c {shlex.quote(sql)}"
+        )
+        self.run_remote_command(command)
+
+    def recover_pending_cross_table_expansions(
+        self, database_name: str, limit: int = 25,
+    ) -> list[dict]:
+        """Repair committed inserts whose control-db registration was interrupted.
+
+        The outbox marker is committed atomically with data. No marker means
+        the prior data transaction did not commit. This intentionally does NOT
+        checkpoint partially executed SQL statements.
+        """
+        if not 1 <= limit <= 100:
+            raise ValueError("Recovery limit must be between 1 and 100.")
+        command_base = (
+            f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+            f"-d {shlex.quote(database_name)} -X -qAt -v ON_ERROR_STOP=1 "
+        )
+        existence = self.run_remote_command(
+            command_base + "-c "
+            + shlex.quote("SELECT to_regclass('pgdm_runtime.expansion_commits');")
+        ).strip()
+        if not existence:
+            return []
+        sql = f"""
+SELECT json_build_object(
+    'request', request_payload,
+    'manifest', source_manifest
+)::text
+FROM {EXPANSION_JOURNAL_TABLE}
+WHERE finalized_at IS NULL
+ORDER BY committed_at, job_id
+LIMIT {int(limit)};
+""".strip()
+        output = self.run_remote_command(command_base + "-c " + shlex.quote(sql))
+        completed = []
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            result = dict(item["request"])
+            result["dependency_manifest"] = dict(item["manifest"])
+            registered = self.register_cross_table_expansion_versions(
+                expansion_result=result,
+                requested_by=result.get("requested_by") or "recovery",
+                workstation_name=result.get("workstation_name") or "recovery",
+                cancel_event=None,
+            )
+            completed.append(
+                {"expansion_job_id": result["expansion_job_id"], "versions": registered}
+            )
+        return completed
+
     def register_cross_table_expansion_versions(
         self,
         expansion_result: dict,
@@ -15046,6 +15212,26 @@ COMMIT;
             raise RuntimeError(
                 "The expansion result does not contain complete destinations or a manifest."
             )
+
+        expansion_job_id = str(
+            (expansion_result or {}).get("expansion_job_id") or ""
+        ).strip()
+        if expansion_job_id:
+            prior_versions = self._get_committed_expansion_receipt(
+                database_name, expansion_job_id
+            )
+            if prior_versions is not None:
+                expected_tables = [
+                    str(destination.get("table_name") or "").strip()
+                    for destination in destinations
+                ]
+                version_map = {row["table_name"]: row for row in prior_versions}
+                if set(version_map) != set(expected_tables):
+                    raise RuntimeError(
+                        "Committed expansion receipt has incomplete destination versions."
+                    )
+                self._finalize_expansion_journal(database_name, expansion_job_id)
+                return [version_map[name] for name in expected_tables]
 
         source_full_table_name = f"{source_schema_name}.{source_table_name}"
         source_versions = self._canonical_source_version_references(
@@ -15099,6 +15285,22 @@ CREATE TEMP TABLE pgdm_expansion_timings (
                 f"{CONTROL_SCHEMA}.table_versions:"
                 f"{database_name}:{schema_name}:{table_name}"
             )
+        if expansion_job_id:
+            # One registration attempt per committed data job, even if two
+            # clients try to recover simultaneously after an SSH disconnect.
+            lock_key = "pgdm_expansion_job:" + expansion_job_id
+            sql_parts.append(
+                "SELECT pg_advisory_xact_lock(hashtextextended("
+                f"{sql_literal(lock_key)}, 0));\n"
+                "DO $pgdm_expansion_receipt$\n"
+                "BEGIN\n"
+                f"IF EXISTS (SELECT 1 FROM {EXPANSION_RECEIPT_TABLE} "
+                f"WHERE job_id = {sql_literal(expansion_job_id)}) THEN\n"
+                "RAISE EXCEPTION 'Expansion version receipt already exists; retry recovery';\n"
+                "END IF;\n"
+                "END\n"
+                "$pgdm_expansion_receipt$;"
+            )
         timing_sequence = 1
         for lock_key in sorted(destination_lock_keys):
             lock_table_name = lock_key.rsplit(":", 1)[-1]
@@ -15148,6 +15350,8 @@ CREATE TEMP TABLE pgdm_expansion_timings (
                 )
 
             dependency_payload = dict(base_manifest)
+            if expansion_job_id:
+                dependency_payload["expansion_job_id"] = expansion_job_id
             dependency_payload["destination_columns"] = destination_columns
             dependency_payload[
                 "destination_read_relations"
@@ -15268,6 +15472,13 @@ FROM inserted_version;
             normalized_destinations.append(full_table_name)
             version_statement_sequence += 1
 
+        if expansion_job_id:
+            # Durable receipt is in the SAME control-database transaction as
+            # the version rows and their dependency manifests.
+            sql_parts.append(
+                f"INSERT INTO {EXPANSION_RECEIPT_TABLE} (job_id) "
+                f"VALUES ({sql_literal(expansion_job_id)});"
+            )
         sql_parts.extend(
             [
                 """
@@ -15407,6 +15618,8 @@ DROP TABLE pg_temp.pgdm_expansion_timings;
                 + "."
             )
 
+        if expansion_job_id:
+            self._finalize_expansion_journal(database_name, expansion_job_id)
         self._notify_progress(
             progress_callback,
             "version",

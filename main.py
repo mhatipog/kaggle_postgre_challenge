@@ -5310,6 +5310,25 @@ class App(ctk.CTk):
         source_table_name: str,
     ):
         try:
+            recovered = self.service.recover_pending_cross_table_expansions(
+                database_name
+            )
+            if recovered:
+                self.ui(self.set_table_action_buttons_busy, False)
+                self.ui(
+                    self.set_status,
+                    f"Recovered {len(recovered)} committed expansion(s).",
+                    "success",
+                )
+                self.ui(
+                    self.show_info,
+                    "Committed expansion recovered",
+                    "A previous expansion committed its data but did not finish "
+                    "version confirmation. Version history has been reconciled "
+                    "from the durable journal. Review the destination tables "
+                    "before starting another expansion.",
+                )
+                return
             tables = self.service.list_tables(database_name)
             available_tables = [
                 table_name
@@ -5450,6 +5469,8 @@ class App(ctk.CTk):
                 ),
                 post_commit_callback=self.begin_cross_table_expansion_finalization,
                 timing_report=timing_report,
+                requested_by=expansion_request["requested_by"],
+                workstation_name=socket.gethostname(),
             )
 
             # O COMMIT dos dados ja ocorreu. Daqui em diante a operacao precisa

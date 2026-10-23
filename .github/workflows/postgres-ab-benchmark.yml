@@ -2,7 +2,7 @@ name: Official-data PostgreSQL SQL benchmark
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, competition/jsonb-record-optimization]
     paths:
       - 'benchmarks/**'
       - 'SQL files/**'
@@ -39,6 +39,9 @@ jobs:
       - name: Benchmark baseline and candidate on identical official data
         run: |
           python benchmarks/compare_sql.py --host 127.0.0.1 --user kaggle_ci --repeats 2 --out benchmark_results.json
+      - name: Test post-commit crash recovery and idempotent versioning
+        run: |
+          python benchmarks/test_recovery_integration.py --user kaggle_ci
       - name: Upload metrics for inspection
         if: always()
         uses: actions/upload-artifact@v4
