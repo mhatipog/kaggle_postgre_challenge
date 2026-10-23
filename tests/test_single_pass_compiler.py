@@ -4,6 +4,7 @@ import unittest
 
 from services.postgres_service import PostgresAdminService
 from services.expansion_stage import plan_single_pass_projection
+from services.expansion_stage_typed import specialize_typed_fields
 
 ROOT = Path(__file__).resolve().parents[1]
 RECIPES = [
@@ -46,6 +47,25 @@ class SinglePassSourceTest(unittest.TestCase):
                 self.assertIn("pg_temp.pgdm_source_stage", statement)
                 self.assertNotRegex(statement, r"\bsource_row\.raw\b")
                 self.assertNotIn("extracted.", statement)
+
+    def test_typed_specialization_preserves_validated_structure(self):
+        prepared = self.make_prepared()
+        original = plan_single_pass_projection(prepared, self.source_columns())
+        typed = specialize_typed_fields(prepared, original)
+        self.assertGreaterEqual(typed.get("typed_fields", 0), 40)
+        self.assertIn("::numeric AS", typed["stage_sql"])
+        self.assertIn("::smallint AS", typed["stage_sql"])
+        self.assertNotIn("BTRIM(position_data.weight_text)", typed["rewritten_destinations"][5][0])
+        self.assertNotIn("BTRIM(position_data.declared_number_text)", typed["rewritten_destinations"][5][0])
+        self.assertIn("pg_temp.pgdm_source_stage", typed["rewritten_destinations"][5][0])
+
+    def test_typed_optimization_falls_back_for_unexpected_expression(self):
+        prepared = self.make_prepared()
+        plan = plan_single_pass_projection(prepared, self.source_columns())
+        plan["rewritten_destinations"][2][0] += (
+            ' AND source_row."pgdm_v_integer_column_2" IS NOT NULL'
+        )
+        self.assertIs(specialize_typed_fields(prepared, plan), plan)
 
     def test_unknown_source_expression_requires_safe_fallback(self):
         prepared = self.make_prepared()
