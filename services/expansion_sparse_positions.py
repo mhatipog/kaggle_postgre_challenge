@@ -80,7 +80,7 @@ def rewrite_sparse_positions(statement: str) -> str | None:
     checks = []
     for p, declared, kind, weight, _gap in rows:
         checks.append(
-            f'CASE WHEN source_row."pgdm_v_integer_column_{decl}" = {p}::smallint\n'
+            f'CASE WHEN source_row."pgdm_v_integer_column_{declared}" = {p}::smallint\n'
             f'       AND source_row."pgdm_v_numeric_column_{weight}" >= 0\n'
             f'       AND UPPER(BTRIM(source_row."pgdm_v_text_column_{kind}"))'
             f" IN ('X', 'Y', 'Z')\n"
