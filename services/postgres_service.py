@@ -14130,6 +14130,71 @@ SELECT json_build_object(
 )::text
 FROM pg_temp.pgdm_expansion_timings;
 """.strip()
+            # Experimental bulk-load fast path.  Never bypass the relational
+            # integrity gate: constraints are re-added and VALIDATED before
+            # the destination transaction commits.  Any failure rolls back
+            # both inserted rows and the DDL.  Off unless explicitly enabled.
+            bulk_fk_prepare_sql = ""
+            bulk_fk_restore_sql = ""
+            if os.getenv("PDM_EXPANSION_BULK_FK_REBUILD", "0") == "1":
+                table_identifiers = [
+                    f"{sql_ident(d['schema_name'])}.{sql_ident(d['pure_table_name'])}"
+                    for d in prepared["destinations"]
+                ]
+                empty_condition = " AND ".join(
+                    f"NOT EXISTS (SELECT 1 FROM {table} LIMIT 1)"
+                    for table in table_identifiers
+                )
+                registered_tables = ", ".join(
+                    f"{sql_literal(identifier)}::regclass"
+                    for identifier in table_identifiers
+                )
+                bulk_fk_prepare_sql = f"""
+CREATE TEMP TABLE pgdm_bulk_saved_foreign_keys (
+    table_name text NOT NULL,
+    constraint_name text NOT NULL,
+    definition text NOT NULL
+) ON COMMIT DROP;
+DO $pgdm_bulk$
+DECLARE current_fk record;
+BEGIN
+    IF {empty_condition} THEN
+        FOR current_fk IN
+            SELECT con.conrelid::regclass::text AS table_name,
+                   con.conname AS constraint_name,
+                   pg_get_constraintdef(con.oid) AS definition
+            FROM pg_constraint AS con
+            WHERE con.contype = 'f'
+              AND con.conrelid IN ({registered_tables})
+            ORDER BY con.conrelid, con.conname
+        LOOP
+            INSERT INTO pg_temp.pgdm_bulk_saved_foreign_keys
+                (table_name, constraint_name, definition)
+            VALUES (current_fk.table_name, current_fk.constraint_name,
+                    current_fk.definition);
+            EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I',
+                           current_fk.table_name, current_fk.constraint_name);
+        END LOOP;
+    END IF;
+END
+$pgdm_bulk$;
+"""
+                bulk_fk_restore_sql = """
+DO $pgdm_bulk$
+DECLARE current_fk record;
+BEGIN
+    FOR current_fk IN
+        SELECT table_name, constraint_name, definition
+        FROM pg_temp.pgdm_bulk_saved_foreign_keys
+        ORDER BY table_name, constraint_name
+    LOOP
+        EXECUTE format('ALTER TABLE %s ADD CONSTRAINT %I %s',
+                       current_fk.table_name, current_fk.constraint_name,
+                       current_fk.definition);
+    END LOOP;
+END
+$pgdm_bulk$;
+"""
             wrapped_sql = (
                 journal_table_sql
                 + "\n"
@@ -14153,7 +14218,9 @@ FROM pg_temp.pgdm_expansion_timings;
                 + manifest_sql
                 + "\nUPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
                 + "clock_timestamp() WHERE sequence_number = 3;\n\n"
+                + "\n\n" + bulk_fk_prepare_sql
                 + "\n\n".join(execution_statements)
+                + "\n\n" + bulk_fk_restore_sql
                 + "\n\n" + journal_commit_sql
                 + "\n\nINSERT INTO pg_temp.pgdm_expansion_timings VALUES "
                 + "(9000, 'execute', 'Commit expansion transaction', "
