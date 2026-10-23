@@ -1,0 +1,47 @@
+name: Deferred PK recovery and rollback (official 3k dataset)
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/pk-recovery-gate.yml'
+      - 'services/postgres_service.py'
+      - 'benchmarks/test_recovery_integration.py'
+  workflow_dispatch:
+
+jobs:
+  recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PDM_BENCH_PG_USER: kaggle_ci
+      PDM_EXPANSION_REBUILD_PRIMARY_KEYS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies and start PostgreSQL
+        run: |
+          python -m pip install -r requirements.txt
+          sudo systemctl start postgresql
+      - name: Create local-only test credentials
+        shell: bash
+        run: |
+          password="$(openssl rand -hex 24)"
+          echo "::add-mask::$password"
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE kaggle_ci WITH LOGIN CREATEDB PASSWORD '$password';"
+          echo "PGPASSWORD=$password" >> "$GITHUB_ENV"
+          echo "PG_KAGGLE_CHALLENGE_PASS=$password" >> "$GITHUB_ENV"
+      - name: Generate unmodified official challenge data
+        run: |
+          python generate_database.py --rows 3000 --host 127.0.0.1 --postgres_port 5432 --user kaggle_ci --admin_database postgres
+      - name: Snapshot original 27 PK FK UNIQUE indexes and constraints
+        run: |
+          python benchmarks/assert_schema_invariants.py --file benchmark_comparison/schema_before.json
+      - name: Execute six-destination expansion and simulated crash recovery
+        run: |
+          python benchmarks/test_recovery_integration.py --user kaggle_ci
+      - name: Verify original index and constraint definitions after crash rollback
+        run: |
+          python benchmarks/assert_schema_invariants.py --file benchmark_comparison/schema_before.json --verify
