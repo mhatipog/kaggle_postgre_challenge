@@ -18,6 +18,7 @@ jobs:
       PDM_BENCH_PG_USER: kaggle_ci
       PDM_BENCH_SSH_USER: kagglebench
       PDM_EXPANSION_WORKERS: '2'
+      PDM_EXPANSION_BULK_FK_REBUILD: '1'
     steps:
       - name: Checkout our candidate
         uses: actions/checkout@v4
