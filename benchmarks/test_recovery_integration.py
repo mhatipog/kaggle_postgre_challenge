@@ -127,12 +127,111 @@ def main() -> None:
         f"WHERE job_id = '{job_id}' AND finalized_at IS NOT NULL;",
     )
     assert finalized == "1"
+    # Simulate the control transaction COMMIT succeeding, but its SSH reply
+    # being lost. The next connection must detect the already-written receipt.
+    query(
+        reconnected, args.database,
+        "TRUNCATE TABLE public.table2, public.table5, public.table6, "
+        "public.table1, public.table4, public.table3 RESTART IDENTITY CASCADE;",
+    )
+    second = service(args.user, password)
+    result_two = second.execute_cross_table_expansion(
+        database_name=args.database,
+        source_full_table_name="public.raw_data",
+        raw_schemas=["group001"],
+        destinations=destinations,
+        requested_by="CI recovery test",
+        workstation_name="ci-local",
+    )
+    job_two = result_two["expansion_job_id"]
+    original_remote = second.run_remote_command
+
+    def drop_control_reply(command, stdin_text=None, **kwargs):
+        response = original_remote(command, stdin_text=stdin_text, **kwargs)
+        if (
+            "-d postgres_data_manager " in command
+            and isinstance(stdin_text, str)
+            and "Commit atomic version batch" in stdin_text
+        ):
+            raise ConnectionError("Simulated SSH response loss after control COMMIT")
+        return response
+
+    second.run_remote_command = drop_control_reply
+    try:
+        second.register_cross_table_expansion_versions(
+            result_two, requested_by="CI recovery test", workstation_name="ci-local"
+        )
+        raise AssertionError("Expected simulated response loss")
+    except ConnectionError:
+        pass
+    third = service(args.user, password)
+    recovered_reply_loss = third.recover_pending_cross_table_expansions(args.database)
+    assert len(recovered_reply_loss) == 1, recovered_reply_loss
+    assert recovered_reply_loss[0]["expansion_job_id"] == job_two
+    assert third.recover_pending_cross_table_expansions(args.database) == []
+    dep_count = query(
+        third, "postgres_data_manager",
+        "SELECT count(*) FROM app_control.table_version_dependencies "
+        f"WHERE dependency_payload ->> 'expansion_job_id' = '{job_two}';",
+    )
+    assert dep_count == "6", f"Version duplication after lost reply: {dep_count}"
+    print("Recovered lost control COMMIT reply without duplicating versions.", flush=True)
+
+    # A failing SQL step inside the data transaction must rollback everything,
+    # including the recovery marker. No partial destination inserts survive.
+    query(
+        third, args.database,
+        "TRUNCATE TABLE public.table2, public.table5, public.table6, "
+        "public.table1, public.table4, public.table3 RESTART IDENTITY CASCADE;",
+    )
+    before_failed_journal = query(
+        third, args.database,
+        "SELECT count(*) FROM pgdm_runtime.expansion_commits;",
+    )
+    failing = service(args.user, password)
+    real_remote = failing.run_remote_command
+
+    def force_precommit_error(command, stdin_text=None, **kwargs):
+        if (
+            "-d kaggle_challenge " in command
+            and isinstance(stdin_text, str)
+            and "INSERT INTO pgdm_runtime.expansion_commits" in stdin_text
+        ):
+            marker = "INSERT INTO pg_temp.pgdm_expansion_timings VALUES (9000"
+            assert marker in stdin_text
+            stdin_text = stdin_text.replace(marker, "SELECT 1 / 0;\\n" + marker, 1)
+        return real_remote(command, stdin_text=stdin_text, **kwargs)
+
+    failing.run_remote_command = force_precommit_error
+    try:
+        failing.execute_cross_table_expansion(
+            database_name=args.database,
+            source_full_table_name="public.raw_data",
+            raw_schemas=["group001"],
+            destinations=destinations,
+            requested_by="CI recovery test",
+            workstation_name="ci-local",
+        )
+        raise AssertionError("Expected injected SQL failure before COMMIT")
+    except RuntimeError as exc:
+        assert "division by zero" in str(exc).lower(), str(exc)
+    after_failed_journal = query(
+        third, args.database,
+        "SELECT count(*) FROM pgdm_runtime.expansion_commits;",
+    )
+    assert before_failed_journal == after_failed_journal
+    for _filename, table_name in SQL_NAMES:
+        assert query(third, args.database, f"SELECT count(*) FROM {table_name};") == "0"
+    print("Simulated pre-COMMIT failure rolled back every destination and marker.", flush=True)
+
     print(json.dumps({
         "recovered_job": job_id,
         "version_count": len(repaired[0]["versions"]),
         "second_recovery": 0,
         "idempotent_registration": True,
         "journal_finalized": True,
+        "lost_control_reply_recovered": True,
+        "precommit_rollback_consistent": True,
     }, indent=2), flush=True)
 
 
