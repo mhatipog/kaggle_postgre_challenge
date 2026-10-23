@@ -31,6 +31,7 @@ The reported metric is the application's measured processing total (not just EXP
 | 1,000,000 | 83.858 s | 30.483 s | **26.840 s** | 12.0% lower time |
 | 1,000,000 (final default release, no flags) | 129.150 s | 45.417 s | **40.587 s** | 10.6% lower time |
 | 3,000,000 | 343.913 s | 121.637 s | **107.176 s** | 11.9% lower time |
+| 10,000,000 | 1,418.252 s | 457.020 s | **446.504 s** | 2.3% lower time |
 
 These are separate controlled experiments and should not be interpreted as repeated trials on identical hardware. The **final release-default 1M run** is intentionally included separately because runner performance differs; it proves that the same optimization activates through the ordinary application service without manually set experiment flags. We make no claim of 300-million-row validation or superiority to non-public submissions.
 
@@ -38,6 +39,7 @@ These are separate controlled experiments and should not be interpreted as repea
 - [100k typed-stage comparison (passing)](https://github.com/mhatipog/kaggle_postgre_challenge/actions/runs/39930589692)
 - [1M metadata-pruned typed-stage comparison (passing)](https://github.com/mhatipog/kaggle_postgre_challenge/actions/runs/39931251847)
 - [3M metadata-pruned typed-stage comparison (passing)](https://github.com/mhatipog/kaggle_postgre_challenge/actions/runs/39932278207)
+- [10M stress comparison, resource observations, all integrity and crash-recovery checks passing](https://github.com/mhatipog/kaggle_postgre_challenge/actions/runs/39950657540)
 - [Final release 1M comparison — no optimization environment switches; output, schema and crash-recovery checks passing](https://github.com/mhatipog/kaggle_postgre_challenge/actions/runs/39938033053)
 - `.github/workflows/competitor-reproduction.yml` is a self-contained public re-run and should show the verified release-default path, with all output checks.
 
@@ -80,3 +82,7 @@ Similarly, the optimization reduces some materialized staging width, but no meas
 https://github.com/mhatipog/kaggle_postgre_challenge
 
 The exact immutable commit SHA must be included in the submitted Kaggle writeup after promotion to `main`. No hidden private code, credentials or custom external API service is required.
+
+## Latest 10M resource caveat
+
+The official 10M-row generator was independently exercised on a public GitHub-hosted Linux runner against the pinned public bcap52 commit, with successful six-table output parity and failure-injection recovery. Whole-runner disk and memory observations are available in the benchmark artifact, but are **not** controlled measurements of PostgreSQL private peak RAM, temporary-file use, or official judging resource scores. The difference in measured processing time at 10M is only 2.3%, so repeated or reversed-order measurements would be needed to determine its stability.
