@@ -60,7 +60,7 @@ class SinglePassSourceTest(unittest.TestCase):
         prepared["raw_schemas"] = ["another_scope"]
         with patch.dict("os.environ", {"PDM_EXPANSION_STAGE_STATS": "join-only"}):
             fallback = plan_single_pass_projection(prepared, self.source_columns())
-        self.assertIn("ANALYZE pg_temp.pgdm_source_stage;", fallback["stage_sql"])
+        self.assertIsNone(fallback, "Unexpected source scope must fail safe")
 
     def test_typed_specialization_preserves_validated_structure(self):
         prepared = self.make_prepared()
