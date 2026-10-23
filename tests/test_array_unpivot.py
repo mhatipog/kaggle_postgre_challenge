@@ -50,7 +50,7 @@ class ArrayUnpivotTests(unittest.TestCase):
         self.assertEqual(rewritten.count("::smallint[]"), 1)
         self.assertEqual(rewritten.count("::numeric[]"), 2)
         self.assertEqual(rewritten.count("::text[]"), 1)
-        self.assertIn("WHERE position_data.declared_number_text =", rewritten)
+        self.assertRegex(rewritten, r"WHERE position_data\.declared_number_text\s*=\s*position_data\.position_number")
         self.assertIn("JOIN public.table1 AS main_row", rewritten)
         self.assertNotIn("    VALUES\n", rewritten)
 
