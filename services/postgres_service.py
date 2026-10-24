@@ -14108,7 +14108,7 @@ SELECT payload::text FROM pg_temp.pgdm_expansion_manifest_payload;
             destination_lock_sql = self._build_cross_table_expansion_lock_sql(
                 prepared["destinations"]
             )
-            # Opt-in performance experiment: reuse the materialized projection
+            # Official-challenge release path: reuse the materialized projection
             # for the exact dependency manifest. The original source scope and
             # version manifest format remain unchanged, and any unsupported
             # layout safely falls back to the original full source scan.
@@ -14116,7 +14116,7 @@ SELECT payload::text FROM pg_temp.pgdm_expansion_manifest_payload;
             if (
                 competition_fastpath
                 and projection_plan is not None
-                and os.getenv("PDM_EXPANSION_MANIFEST_FROM_STAGE", "0") == "1"
+                and os.getenv("PDM_EXPANSION_MANIFEST_FROM_STAGE", "1") == "1"
             ):
                 source_ref = (
                     f"{sql_ident(source_schema_name)}.{sql_ident(source_table_name)}"
@@ -14272,8 +14272,9 @@ BEGIN
 END
 $pgdm_bulk$;
 """
-            # Experimental, challenge-only PK index bulk rebuild. The standard
-            # default keeps primary-key indexes in place. For empty destinations,
+            # Official-challenge release PK index bulk rebuild. The standard
+            # path retains primary keys except during the validated empty-destination
+            # transactional bulk rebuild. For empty destinations,
             # FKs and UNIQUE constraints are already removed transactionally;
             # drop/rebuild destination PKs in the *same transaction* to avoid
             # maintaining millions of identity indexes row-by-row. PostgreSQL
@@ -14281,7 +14282,7 @@ $pgdm_bulk$;
             # dependency makes DROP fail and rolls the entire expansion back.
             if (
                 competition_fastpath
-                and os.getenv("PDM_EXPANSION_REBUILD_PRIMARY_KEYS", "0") == "1"
+                and os.getenv("PDM_EXPANSION_REBUILD_PRIMARY_KEYS", "1") == "1"
                 and bulk_fk_prepare_sql
                 and bulk_fk_restore_sql
             ):
