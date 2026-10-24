@@ -25,14 +25,9 @@ We benchmarked the unmodified original path, the pinned public `bcap52` implemen
 
 The reported metric is the application's measured processing total (not just EXPLAIN query time). These comparisons are controlled *within each run*; runner speed differs across runs. The competitor implementation is pinned to `7b81ca2797f06304d81477afcb0cfb3dad75ff43`.
 
-| Official generator rows | Original pipeline | Public bcap52 fast path | Our candidate | Our advantage vs bcap52 |
-|---:|---:|---:|---:|---:|
-| 100,000 | 12.109 s | 10.713 s | **5.783 s** | 46.0% lower time |
-| 1,000,000 | 83.858 s | 30.483 s | **26.840 s** | 12.0% lower time |
-| 1,000,000 (final default release, no flags) | 129.150 s | 45.417 s | **40.587 s** | 10.6% lower time |
-| 3,000,000 | 343.913 s | 121.637 s | **107.176 s** | 11.9% lower time |
+Across controlled PostgreSQL + SSH experiments, the optimized pipeline reduced processing time compared with the unchanged original path. We also reproduced a published third-party fast path under the same runner conditions. The source generator, source data and destination-reset procedure were kept consistent within each comparison.
 
-These are separate controlled experiments and should not be interpreted as repeated trials on identical hardware. The **final release-default 1M run** is intentionally included separately because runner performance differs; it proves that the same optimization activates through the ordinary application service without manually set experiment flags. We make no claim of 300-million-row validation or superiority to non-public submissions.
+**Detailed timings and competitor comparisons are intentionally deferred until the final Kaggle submission is prepared after the remaining validation runs.** Results from different hosted runners should not be treated as directly comparable. No claim is made about official judge ranking or validation at the competition's largest scale.
 
 **Primary reproducible evidence:**
 - [100k typed-stage comparison (passing)](https://github.com/mhatipog/kaggle_postgre_challenge/actions/runs/39930589692)
