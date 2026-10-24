@@ -83,7 +83,7 @@ jobs:
           python - <<'PY'
           import json
           from pathlib import Path
-          record=json.loads(Path('../benchmark_comparison/our_candidate.json').read_text())
+          record=json.loads(Path('../benchmark_comparison/release_default.json').read_text())
           stages=[x['name'] for x in record.get('items',[])]
           assert any('Single-pass shared JSONB source projection' in x for x in stages), 'Release default silently fell back to legacy path'
           print('PASS: single-pass release optimization active by default')
