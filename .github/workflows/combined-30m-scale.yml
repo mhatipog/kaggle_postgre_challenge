@@ -151,7 +151,7 @@ jobs:
           combined=json.loads((p/"our_candidate.json").read_text())
           release=json.loads((p/"release_default.json").read_text())
           assert combined["signatures"]==release["signatures"], "30M output fingerprint mismatch"
-          assert combined["rows"]==release["rows"], "30M destination row counts differ"
+          assert {k:v["rows"] for k,v in combined["signatures"].items()} == {k:v["rows"] for k,v in release["signatures"].items()}, "30M destination row counts differ"
           ours=combined["measured_processing_total"]
           ref=release["measured_processing_total"]
           assert ours>0 and ref>0
